@@ -1,6 +1,10 @@
 """
 Qwen3-TTS server: voice cloning with the Qwen3-TTS Base model.
 
+Backends (BACKEND env)
+  faster   faster-qwen3-tts: CUDA-graph decode, typically 5-10x the stock speed (default)
+  stock    the reference qwen_tts implementation
+
 Endpoints
   GET  /                      test web UI
   GET  /livez                 process is up
@@ -15,6 +19,7 @@ Endpoints
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -23,8 +28,8 @@ import re
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -40,14 +45,17 @@ from starlette.concurrency import run_in_threadpool
 # --------------------------------------------------------------------------- config
 
 MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+BACKEND = os.getenv("BACKEND", "faster").lower()       # faster | stock
 DTYPE = os.getenv("DTYPE", "bfloat16")
 ATTN_IMPL = os.getenv("ATTN_IMPL", "sdpa")            # sdpa | flash_attention_2 | eager
 DEVICE = os.getenv("DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu")
+MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", "2048"))   # faster backend: static KV-cache size (prompt + output tokens)
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 VOICES_DIR = DATA_DIR / "voices"
 DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "Auto")
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "")
 MAX_REF_SECONDS = float(os.getenv("MAX_REF_SECONDS", "30"))
+REF_TAIL_SILENCE = float(os.getenv("REF_TAIL_SILENCE", "0.5"))  # stops the clip's last phoneme bleeding into output
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "350"))     # long input is split on sentences
 CHUNK_GAP_MS = int(os.getenv("CHUNK_GAP_MS", "120"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "8000"))
@@ -59,44 +67,84 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 log = logging.getLogger("qwen3-tts")
 
 # --------------------------------------------------------------------------- model state
+#
+# All GPU work (loading, CUDA-graph capture, prompt building, generation) runs on ONE
+# dedicated thread. CUDA graphs must be replayed consistently, and a single GPU can only
+# usefully run one generation at a time anyway, so this doubles as the request queue.
 
-_model = None
+_gpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
+_engine = None        # object with generate_voice_clone(): FasterQwen3TTS or Qwen3TTSModel
+_base = None          # the qwen_tts.Qwen3TTSModel (prompt building, languages)
 _model_error: Optional[str] = None
 _sample_rate = 24000
-_gpu_lock = threading.Lock()             # one generation at a time on the GPU
-_prompt_cache: dict[str, object] = {}    # voice name -> voice_clone_prompt items
+_prompt_cache: dict[str, object] = {}   # voice name -> voice_clone_prompt items
+
+
+async def on_gpu(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(_gpu, fn, *args)
 
 
 def _load_model() -> None:
-    global _model, _model_error, _sample_rate
+    global _engine, _base, _model_error, _sample_rate
+    t0 = time.time()
     try:
-        from qwen_tts import Qwen3TTSModel
+        if BACKEND == "faster":
+            from faster_qwen3_tts import FasterQwen3TTS
 
-        t0 = time.time()
-        log.info("loading %s on %s (dtype=%s, attn=%s)", MODEL_ID, DEVICE, DTYPE, ATTN_IMPL)
-        _model = Qwen3TTSModel.from_pretrained(
-            MODEL_ID,
-            device_map=DEVICE,
-            dtype=getattr(torch, DTYPE),
-            attn_implementation=ATTN_IMPL,
-        )
-        if getattr(_model.model, "tts_model_type", "base") != "base":
-            raise RuntimeError(f"{MODEL_ID} is not a Base (voice clone) model")
-        # warm up once so the first real request isn't slow
-        sr = 24000
-        warm = (np.zeros(sr, dtype=np.float32) + 1e-4, sr)
-        with torch.inference_mode():
-            _model.generate_voice_clone(
-                text="Ready.", language="English", ref_audio=warm, x_vector_only_mode=True, max_new_tokens=32
+            log.info("loading %s with faster-qwen3-tts on %s (dtype=%s, attn=%s, max_seq_len=%d)",
+                     MODEL_ID, DEVICE, DTYPE, ATTN_IMPL, MAX_SEQ_LEN)
+            _engine = FasterQwen3TTS.from_pretrained(
+                MODEL_ID, device=DEVICE, dtype=getattr(torch, DTYPE),
+                attn_implementation=ATTN_IMPL, max_seq_len=MAX_SEQ_LEN,
             )
-        if torch.cuda.is_available():
-            gb = torch.cuda.memory_allocated() / 1024**3
-            log.info("model ready in %.1fs, %.2f GB VRAM allocated", time.time() - t0, gb)
+            _base = _engine.model
+            log.info("capturing CUDA graphs")
+            _engine.warmup()
+        elif BACKEND == "stock":
+            from qwen_tts import Qwen3TTSModel
+
+            log.info("loading %s with stock qwen_tts on %s (dtype=%s, attn=%s)", MODEL_ID, DEVICE, DTYPE, ATTN_IMPL)
+            _engine = Qwen3TTSModel.from_pretrained(
+                MODEL_ID, device_map=DEVICE, dtype=getattr(torch, DTYPE), attn_implementation=ATTN_IMPL,
+            )
+            _base = _engine
         else:
-            log.info("model ready in %.1fs (CPU)", time.time() - t0)
+            raise ValueError(f"BACKEND must be 'faster' or 'stock', got {BACKEND!r}")
+
+        if getattr(_base.model, "tts_model_type", "base") != "base":
+            raise RuntimeError(f"{MODEL_ID} is not a Base (voice clone) model")
+
+        # one short real generation so the first request isn't slow
+        warm = (np.full(24000, 1e-4, dtype=np.float32), 24000)
+        with torch.inference_mode():
+            prompt = _base.create_voice_clone_prompt(ref_audio=warm, x_vector_only_mode=True)
+            _, _sample_rate = _call_engine("Ready.", "English", prompt, {"max_new_tokens": 32})
+        vram = f", {torch.cuda.memory_allocated() / 1024**3:.2f} GB VRAM allocated" if torch.cuda.is_available() else ""
+        log.info("model ready (%s backend) in %.1fs%s", BACKEND, time.time() - t0, vram)
     except Exception as e:  # keep the process alive so /healthz can report the error
+        _engine = _base = None
         _model_error = f"{type(e).__name__}: {e}"
         log.exception("model failed to load")
+
+
+def _call_engine(text: str, language: str, prompt, kw: dict):
+    """One generation call, adapting sampling kwargs to the backend."""
+    if BACKEND == "faster":
+        # faster-qwen3-tts takes these directly; its sub-talker sampling is fixed at graph capture
+        allowed = ("temperature", "top_p", "top_k", "repetition_penalty", "max_new_tokens")
+        args = {k: v for k, v in kw.items() if k in allowed}
+        if "max_new_tokens" in args:
+            args["max_new_tokens"] = min(args["max_new_tokens"], MAX_SEQ_LEN)
+        wavs, sr = _engine.generate_voice_clone(text=text, language=language, voice_clone_prompt=prompt, **args)
+    else:
+        args = dict(kw)
+        # keep the sub-talker (residual codebooks) in step with the main temperature/top_p
+        if "temperature" in args:
+            args["subtalker_temperature"] = args["temperature"]
+        if "top_p" in args:
+            args["subtalker_top_p"] = args["top_p"]
+        wavs, sr = _engine.generate_voice_clone(text=text, language=language, voice_clone_prompt=prompt, **args)
+    return np.asarray(wavs[0], dtype=np.float32).reshape(-1), int(sr)
 
 
 # --------------------------------------------------------------------------- voices on disk
@@ -109,8 +157,7 @@ def _voice_dir(name: str) -> Path:
 
 
 def _read_meta(name: str) -> dict:
-    d = _voice_dir(name)
-    meta_path = d / "meta.json"
+    meta_path = _voice_dir(name) / "meta.json"
     if not meta_path.exists():
         raise HTTPException(404, f"voice '{name}' not found")
     return json.loads(meta_path.read_text())
@@ -149,19 +196,26 @@ async def _save_upload(upload: UploadFile, workdir: Path) -> Path:
     return raw
 
 
-def _get_prompt(name: str):
-    if name in _prompt_cache:
-        return _prompt_cache[name]
-    meta = _read_meta(name)
-    ref = str(_voice_dir(name) / "ref.wav")
-    with _gpu_lock, torch.inference_mode():
-        items = _model.create_voice_clone_prompt(
-            ref_audio=ref,
-            ref_text=meta.get("ref_text") or None,
-            x_vector_only_mode=not bool(meta.get("ref_text")),
+def _build_prompt(ref_wav: str, ref_text: str):
+    """Voice-clone prompt from a reference clip. Runs on the GPU thread."""
+    audio, sr = sf.read(ref_wav, dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    icl = bool(ref_text)
+    if icl and REF_TAIL_SILENCE > 0:
+        audio = np.concatenate([audio, np.zeros(int(REF_TAIL_SILENCE * sr), dtype=np.float32)])
+    with torch.inference_mode():
+        return _base.create_voice_clone_prompt(
+            ref_audio=(audio, int(sr)), ref_text=ref_text or None, x_vector_only_mode=not icl,
         )
-    _prompt_cache[name] = items
-    return items
+
+
+def _get_prompt(name: str):
+    """Cached prompt for a saved voice. Runs on the GPU thread."""
+    if name not in _prompt_cache:
+        meta = _read_meta(name)
+        _prompt_cache[name] = _build_prompt(str(_voice_dir(name) / "ref.wav"), meta.get("ref_text", ""))
+    return _prompt_cache[name]
 
 
 # --------------------------------------------------------------------------- generation
@@ -205,41 +259,39 @@ class GenParams(BaseModel):
 
     def kwargs(self) -> dict:
         fields = ("temperature", "top_p", "top_k", "repetition_penalty", "max_new_tokens")
-        kw = {k: getattr(self, k) for k in fields if getattr(self, k) is not None}
-        # keep the sub-talker (residual codebooks) in step with the main temperature/top_p
-        if "temperature" in kw:
-            kw["subtalker_temperature"] = kw["temperature"]
-        if "top_p" in kw:
-            kw["subtalker_top_p"] = kw["top_p"]
-        return kw
+        return {k: getattr(self, k) for k in fields if getattr(self, k) is not None}
 
 
-def _generate(text: str, language: str, params: GenParams, prompt=None, ref=None) -> np.ndarray:
-    if _model is None:
+def _generate(text: str, language: str, params: GenParams, prompt) -> np.ndarray:
+    """Runs on the GPU thread."""
+    if _engine is None:
         raise HTTPException(503, _model_error or "model is still loading")
     chunks = _split_text(text, CHUNK_CHARS)
     gap = np.zeros(int(_sample_rate * CHUNK_GAP_MS / 1000), dtype=np.float32)
+    if params.seed is not None:
+        torch.manual_seed(params.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(params.seed)
+    t0 = time.time()
     pieces: list[np.ndarray] = []
-    with _gpu_lock, torch.inference_mode():
-        if params.seed is not None:
-            torch.manual_seed(params.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(params.seed)
-        if prompt is None:
-            prompt = _model.create_voice_clone_prompt(**ref)
-        t0 = time.time()
+    with torch.inference_mode():
         for i, chunk in enumerate(chunks):
-            wavs, sr = _model.generate_voice_clone(
-                text=chunk, language=language, voice_clone_prompt=prompt, **params.kwargs()
-            )
+            wav, _ = _call_engine(chunk, language, prompt, params.kwargs())
             if i:
                 pieces.append(gap)
-            pieces.append(np.asarray(wavs[0], dtype=np.float32))
-        audio = np.concatenate(pieces) if pieces else np.zeros(1, dtype=np.float32)
-        secs = len(audio) / sr
-        log.info("generated %.1fs audio in %.1fs (%d chunk%s)", secs, time.time() - t0,
-                 len(chunks), "" if len(chunks) == 1 else "s")
+            pieces.append(wav)
+    audio = np.concatenate(pieces) if pieces else np.zeros(1, dtype=np.float32)
+    secs, took = len(audio) / _sample_rate, time.time() - t0
+    log.info("generated %.1fs audio in %.1fs (%.2fx real time, %d chunk%s)", secs, took,
+             secs / took if took else 0, len(chunks), "" if len(chunks) == 1 else "s")
     return audio
+
+
+def _clone_once(ref_wav: str, ref_text: str, text: str, language: str, params: GenParams) -> np.ndarray:
+    """Runs on the GPU thread."""
+    if _engine is None:
+        raise HTTPException(503, _model_error or "model is still loading")
+    return _generate(text, language, params, _build_prompt(ref_wav, ref_text))
 
 
 MEDIA = {
@@ -283,13 +335,13 @@ def _encode(audio: np.ndarray, fmt: str, speed: float) -> bytes:
 
 # --------------------------------------------------------------------------- app
 
-app = FastAPI(title="Qwen3-TTS", version="1.0")
+app = FastAPI(title="Qwen3-TTS", version="1.1")
 
 
 @app.on_event("startup")
 def _startup() -> None:
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
-    threading.Thread(target=_load_model, daemon=True).start()
+    _gpu.submit(_load_model)
 
 
 @app.get("/livez")
@@ -299,24 +351,24 @@ def livez():
 
 @app.get("/healthz")
 def healthz():
-    if _model is not None:
-        info = {"ok": True, "model": MODEL_ID, "device": DEVICE}
+    if _engine is not None:
+        info = {"ok": True, "model": MODEL_ID, "backend": BACKEND, "device": DEVICE}
         if torch.cuda.is_available():
             info["vram_allocated_gb"] = round(torch.cuda.memory_allocated() / 1024**3, 2)
         return info
     status = 500 if _model_error else 503
-    return JSONResponse({"ok": False, "error": _model_error or "loading"}, status_code=status)
+    return JSONResponse({"ok": False, "backend": BACKEND, "error": _model_error or "loading"}, status_code=status)
 
 
 @app.get("/v1/info")
 def info():
     langs = []
-    if _model is not None:
+    if _base is not None:
         try:
-            langs = sorted(_model.model.get_supported_languages() or [])
+            langs = sorted(_base.model.get_supported_languages() or [])
         except Exception:
             pass
-    return {"model": MODEL_ID, "ready": _model is not None, "error": _model_error,
+    return {"model": MODEL_ID, "backend": BACKEND, "ready": _engine is not None, "error": _model_error,
             "languages": ["Auto", *[str(l).capitalize() for l in langs if str(l).lower() != "auto"]],
             "default_voice": DEFAULT_VOICE, "formats": sorted(MEDIA)}
 
@@ -355,8 +407,8 @@ async def create_voice(
             "duration_s": round(dur, 2), "created": int(time.time())}
     (d / "meta.json").write_text(json.dumps(meta, indent=2))
     _prompt_cache.pop(name, None)
-    if _model is not None:
-        await run_in_threadpool(_get_prompt, name)   # validate + warm the cache now
+    if _engine is not None:
+        await on_gpu(_get_prompt, name)   # validate + warm the cache now
     return meta
 
 
@@ -398,12 +450,12 @@ async def speech(req: SpeechRequest):
         if not v:
             raise HTTPException(400, "no voices saved yet: POST /v1/voices first")
         name = v[0]["name"]
-    if _model is None:
+    if _engine is None:
         raise HTTPException(503, _model_error or "model is still loading")
     meta = _read_meta(name)
     language = req.language or meta.get("language") or DEFAULT_LANGUAGE
-    prompt = await run_in_threadpool(_get_prompt, name)
-    audio = await run_in_threadpool(_generate, req.input, language, req, prompt)
+    prompt = await on_gpu(_get_prompt, name)
+    audio = await on_gpu(_generate, req.input, language, req, prompt)
     data = await run_in_threadpool(_encode, audio, req.response_format, req.speed)
     return Response(data, media_type=MEDIA[req.response_format.lower()],
                     headers={"Content-Disposition": f'inline; filename="speech.{req.response_format.lower()}"'})
@@ -434,9 +486,7 @@ async def clone_once(
         dur = await run_in_threadpool(_to_ref_wav, raw, wav)
         if dur > MAX_REF_SECONDS:
             raise HTTPException(400, f"reference is {dur:.1f}s; keep it under {MAX_REF_SECONDS:.0f}s")
-        ref = {"ref_audio": str(wav), "ref_text": ref_text.strip() or None,
-               "x_vector_only_mode": not ref_text.strip()}
-        audio = await run_in_threadpool(_generate, text, language, params, None, ref)
+        audio = await on_gpu(_clone_once, str(wav), ref_text.strip(), text, language, params)
     data = await run_in_threadpool(_encode, audio, response_format, speed)
     return Response(data, media_type=MEDIA[response_format.lower()])
 

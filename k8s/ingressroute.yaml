@@ -13,6 +13,9 @@ spec:
   routes:
     - kind: Rule
       match: Host(`qwen-tts.rdz.sh`)
+      middlewares:
+      - name: internal-subnets-only
+      - name: security-headers
       services:
         - name: qwen3-tts
           port: 8005

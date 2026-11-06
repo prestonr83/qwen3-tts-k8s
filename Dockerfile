@@ -5,13 +5,14 @@ FROM python:3.12-slim
 
 ARG TORCH_VERSION=2.8.0
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
-ARG QWEN_TTS_VERSION=0.1.1
+# faster-qwen3-tts pulls in qwen-tts-hf (the qwen_tts module on transformers 5),
+# which also serves BACKEND=stock, so one image covers both backends.
+ARG FASTER_QWEN3_TTS_VERSION=0.5.4
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HOME=/models \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
     DATA_DIR=/data
 
 # ffmpeg: decode uploads + encode mp3/opus/flac; sox: required by qwen-tts; libsndfile: soundfile
@@ -23,7 +24,8 @@ RUN apt-get update \
 RUN pip install torch==${TORCH_VERSION} torchaudio==${TORCH_VERSION} --index-url ${TORCH_INDEX}
 
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install qwen-tts==${QWEN_TTS_VERSION} -r /tmp/requirements.txt
+RUN pip install faster-qwen3-tts==${FASTER_QWEN3_TTS_VERSION} -r /tmp/requirements.txt \
+ && python -c "import faster_qwen3_tts, qwen_tts, torch; print('torch', torch.__version__, 'faster-qwen3-tts', faster_qwen3_tts.__version__)"
 
 RUN useradd -m -u 1000 app && mkdir -p /models /data && chown -R app:app /models /data
 WORKDIR /app

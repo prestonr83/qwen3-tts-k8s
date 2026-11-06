@@ -1,0 +1,12 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: qwen-tts.rdz.sh
+  namespace: tts
+spec:
+  dnsNames:
+  - qwen-tts.rdz.sh
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-route53
+  secretName: qwen-tts-rdz-sh-tls

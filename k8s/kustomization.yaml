@@ -3,7 +3,9 @@ kind: Kustomization
 namespace: tts
 resources:
   - qwen3-tts.yaml
-  # - ingressroute.yaml   # uncomment once DNS + TLS secret for qwen-tts.rdz.sh exist
+  - certificate.yaml
+  - middleware.yaml
+  - ingressroute.yaml
 
 images:
   - name: ghcr.io/prestonr83/qwen3-tts-server
