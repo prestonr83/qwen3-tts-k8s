@@ -1,41 +1,49 @@
 """
-Qwen3-TTS server: voice cloning with the Qwen3-TTS Base model.
+Qwen3-TTS web server: UI, voices, presets, saved generations, OpenAI-compatible API.
 
-Backends (BACKEND env)
-  faster   faster-qwen3-tts: CUDA-graph decode, typically 5-10x the stock speed (default)
-  stock    the reference qwen_tts implementation
+The model itself runs in a separate engine worker process (worker.py), one at a time:
+  fast      faster-qwen3-tts (CUDA graphs)            /opt/engines/fast
+  original  qwen-tts 0.1.1 on transformers 4.57.3     /opt/engines/original
+Switching stops the running worker (freeing its VRAM) and starts the other.
 
 Endpoints
-  GET  /                      test web UI
-  GET  /livez                 process is up
-  GET  /healthz               model loaded and ready (503 until then)
-  GET  /v1/audio/voices       saved voices (OpenAI-TTS style, used by Home Assistant)
-  POST /v1/voices             save a voice: multipart file + name + ref_text (+ language)
-  DELETE /v1/voices/{name}    delete a saved voice
-  GET  /v1/voices/{name}/reference   the stored reference clip
-  POST /v1/audio/speech       OpenAI-compatible TTS with a saved voice
-  POST /v1/audio/clone        one-shot clone: multipart file + ref_text + text (nothing saved)
+  GET  /                              web UI
+  GET  /livez                         server process is up (used by all k8s probes)
+  GET  /healthz                       200 once the active engine is ready
+  GET  /v1/engine                     active engine and its status
+  POST /v1/engine                     {"engine": "fast" | "original"}: switch
+  GET  /v1/audio/voices               saved voices (OpenAI-TTS style, used by Home Assistant)
+  POST /v1/voices                     save a voice: multipart file + name + ref_text (+ language)
+  DELETE /v1/voices/{name}            delete a voice
+  GET  /v1/voices/{name}/reference    the stored reference clip
+  POST /v1/audio/speech               OpenAI-compatible TTS with a saved voice ("save": true keeps it)
+  POST /v1/audio/clone                one-shot clone: multipart file + ref_text + text
+  GET  /v1/generations                saved generations, newest first
+  GET  /v1/generations/{id}/audio     a saved generation's WAV
+  DELETE /v1/generations/{id}         delete one ("all" deletes every one)
+  GET  /v1/presets                    saved presets
+  PUT  /v1/presets/{name}             save a preset (voice, language, engine, sliders, seed, format)
+  DELETE /v1/presets/{name}           delete a preset
 """
 
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+import uuid
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
+import httpx
 import soundfile as sf
-import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -44,113 +52,177 @@ from starlette.concurrency import run_in_threadpool
 
 # --------------------------------------------------------------------------- config
 
+ENGINES = {
+    "fast": {"label": "Fast", "python": os.getenv("ENGINE_PYTHON_FAST", "/opt/engines/fast/bin/python"),
+             "desc": "faster-qwen3-tts, CUDA graphs"},
+    "original": {"label": "Original", "python": os.getenv("ENGINE_PYTHON_ORIGINAL", "/opt/engines/original/bin/python"),
+                 "desc": "qwen-tts 0.1.1, transformers 4.57.3"},
+}
+DEFAULT_ENGINE = os.getenv("ENGINE", "fast")
+WORKER_PORT = int(os.getenv("WORKER_PORT", "8101"))
+WORKER_URL = f"http://127.0.0.1:{WORKER_PORT}"
 MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-BACKEND = os.getenv("BACKEND", "faster").lower()       # faster | stock
-DTYPE = os.getenv("DTYPE", "bfloat16")
-ATTN_IMPL = os.getenv("ATTN_IMPL", "sdpa")            # sdpa | flash_attention_2 | eager
-DEVICE = os.getenv("DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu")
-MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", "2048"))   # faster backend: static KV-cache size (prompt + output tokens)
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 VOICES_DIR = DATA_DIR / "voices"
+GEN_DIR = DATA_DIR / "generations"
+PRESETS_FILE = DATA_DIR / "presets.json"
+STATE_FILE = DATA_DIR / "state.json"
 DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "Auto")
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "")
 MAX_REF_SECONDS = float(os.getenv("MAX_REF_SECONDS", "30"))
-REF_TAIL_SILENCE = float(os.getenv("REF_TAIL_SILENCE", "0.5"))  # stops the clip's last phoneme bleeding into output
-CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "350"))     # long input is split on sentences
+CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "350"))
 CHUNK_GAP_MS = int(os.getenv("CHUNK_GAP_MS", "120"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "8000"))
+MAX_GENERATIONS = int(os.getenv("MAX_GENERATIONS", "200"))
+LOAD_TIMEOUT = float(os.getenv("ENGINE_LOAD_TIMEOUT", "1800"))
 
 STATIC_DIR = Path(__file__).parent / "static"
+WORKER_SCRIPT = Path(__file__).parent / "worker.py"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+PRESET_RE = re.compile(r"^[^/\\]{1,64}$")
+GEN_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+LANGUAGES = ["Auto", "English", "Chinese", "Japanese", "Korean", "German", "French",
+             "Russian", "Portuguese", "Spanish", "Italian"]
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s [server] %(message)s")
 log = logging.getLogger("qwen3-tts")
-
-# --------------------------------------------------------------------------- model state
-#
-# All GPU work (loading, CUDA-graph capture, prompt building, generation) runs on ONE
-# dedicated thread. CUDA graphs must be replayed consistently, and a single GPU can only
-# usefully run one generation at a time anyway, so this doubles as the request queue.
-
-_gpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
-_engine = None        # object with generate_voice_clone(): FasterQwen3TTS or Qwen3TTSModel
-_base = None          # the qwen_tts.Qwen3TTSModel (prompt building, languages)
-_model_error: Optional[str] = None
-_sample_rate = 24000
-_prompt_cache: dict[str, object] = {}   # voice name -> voice_clone_prompt items
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-async def on_gpu(fn, *args):
-    return await asyncio.get_running_loop().run_in_executor(_gpu, fn, *args)
+# --------------------------------------------------------------------------- engine manager
 
 
-def _load_model() -> None:
-    global _engine, _base, _model_error, _sample_rate
-    t0 = time.time()
+class EngineManager:
+    def __init__(self) -> None:
+        self.engine: str = DEFAULT_ENGINE
+        self.status: str = "stopped"      # stopped | starting | ready | error
+        self.error: Optional[str] = None
+        self.health: dict = {}
+        self.proc: Optional[subprocess.Popen] = None
+        self.started_at = 0.0
+        self.lock = asyncio.Lock()
+        self._watch: Optional[asyncio.Task] = None
+        self.client = httpx.AsyncClient(base_url=WORKER_URL, timeout=httpx.Timeout(None, connect=5.0))
+
+    def snapshot(self) -> dict:
+        return {"engine": self.engine, "status": self.status, "error": self.error,
+                "loading_seconds": round(time.time() - self.started_at) if self.status == "starting" else None,
+                "versions": self.health.get("versions", {}), "vram_gb": self.health.get("vram_gb"),
+                "model": MODEL_ID,
+                "available": [{"id": k, "label": v["label"], "desc": v["desc"],
+                               "installed": Path(v["python"]).exists()} for k, v in ENGINES.items()]}
+
+    async def start(self, engine: str) -> None:
+        async with self.lock:
+            if engine not in ENGINES:
+                raise HTTPException(400, f"engine must be one of {sorted(ENGINES)}")
+            py = ENGINES[engine]["python"]
+            if not Path(py).exists():
+                raise HTTPException(400, f"engine '{engine}' is not installed in this image ({py})")
+            await self._stop()
+            self.engine, self.status, self.error, self.health = engine, "starting", None, {}
+            self.started_at = time.time()
+            env = dict(os.environ, ENGINE=engine, PYTHONUNBUFFERED="1")
+            log.info("starting %s engine", engine)
+            self.proc = subprocess.Popen([py, str(WORKER_SCRIPT), "--port", str(WORKER_PORT)],
+                                         env=env, cwd=str(WORKER_SCRIPT.parent))
+            _write_json(STATE_FILE, {"engine": engine})
+            self._watch = asyncio.create_task(self._watch_loop(self.proc))
+
+    async def _stop(self) -> None:
+        if self._watch:
+            self._watch.cancel()
+            self._watch = None
+        p, self.proc = self.proc, None
+        if p and p.poll() is None:
+            log.info("stopping %s engine (pid %d)", self.engine, p.pid)
+            p.send_signal(signal.SIGTERM)
+            try:
+                await run_in_threadpool(p.wait, 20)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                await run_in_threadpool(p.wait)
+        self.status = "stopped"
+
+    async def _watch_loop(self, proc: subprocess.Popen) -> None:
+        while True:
+            await asyncio.sleep(1.0 if self.status == "starting" else 5.0)
+            if proc is not self.proc:
+                return
+            code = proc.poll()
+            if code is not None:
+                self.status, self.error = "error", f"{self.engine} engine exited (code {code}); see pod logs"
+                log.error(self.error)
+                return
+            try:
+                h = (await self.client.get("/health", timeout=5.0)).json()
+            except Exception:
+                if self.status == "starting" and time.time() - self.started_at > LOAD_TIMEOUT:
+                    self.status, self.error = "error", "engine did not come up in time"
+                    return
+                continue
+            self.health = h
+            if h.get("error"):
+                self.status, self.error = "error", h["error"]
+            elif h.get("ready"):
+                if self.status != "ready":
+                    log.info("%s engine ready after %.0fs", self.engine, time.time() - self.started_at)
+                self.status, self.error = "ready", None
+
+    def require_ready(self) -> None:
+        if self.status == "ready":
+            return
+        if self.status == "starting":
+            raise HTTPException(503, f"{ENGINES[self.engine]['label']} engine is loading, try again shortly")
+        raise HTTPException(503, self.error or "engine is not running")
+
+    async def generate(self, ref_wav: Path, ref_text: str, text: str, language: str, params: dict,
+                       seed: Optional[int]) -> tuple[bytes, dict]:
+        self.require_ready()
+        body = {"ref_wav": str(ref_wav), "ref_text": ref_text, "text": text, "language": language,
+                "params": params, "seed": seed, "chunk_chars": CHUNK_CHARS, "chunk_gap_ms": CHUNK_GAP_MS}
+        try:
+            r = await self.client.post("/generate", json=body)
+        except httpx.HTTPError as e:
+            raise HTTPException(503, f"engine unavailable: {e}")
+        if r.status_code != 200:
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text
+            raise HTTPException(r.status_code, detail)
+        return r.content, {"gen_seconds": float(r.headers.get("x-gen-seconds", 0)),
+                           "audio_seconds": float(r.headers.get("x-audio-seconds", 0)),
+                           "engine": self.engine}
+
+    async def warm(self, ref_wav: Path, ref_text: str) -> None:
+        if self.status != "ready":
+            return
+        r = await self.client.post("/prompt", json={"ref_wav": str(ref_wav), "ref_text": ref_text})
+        if r.status_code != 200:
+            raise HTTPException(400, f"could not build a voice prompt from this clip: {r.text[:300]}")
+
+
+engines = EngineManager()
+
+
+# --------------------------------------------------------------------------- storage helpers
+
+
+def _write_json(path: Path, data) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def _read_json(path: Path, default):
     try:
-        import qwen_compat
-
-        qwen_compat.apply()   # must run before any model is loaded
-        if BACKEND == "faster":
-            from faster_qwen3_tts import FasterQwen3TTS
-
-            log.info("loading %s with faster-qwen3-tts on %s (dtype=%s, attn=%s, max_seq_len=%d)",
-                     MODEL_ID, DEVICE, DTYPE, ATTN_IMPL, MAX_SEQ_LEN)
-            _engine = FasterQwen3TTS.from_pretrained(
-                MODEL_ID, device=DEVICE, dtype=getattr(torch, DTYPE),
-                attn_implementation=ATTN_IMPL, max_seq_len=MAX_SEQ_LEN,
-            )
-            _base = _engine.model
-            log.info("capturing CUDA graphs")
-            _engine.warmup()
-        elif BACKEND == "stock":
-            from qwen_tts import Qwen3TTSModel
-
-            log.info("loading %s with stock qwen_tts on %s (dtype=%s, attn=%s)", MODEL_ID, DEVICE, DTYPE, ATTN_IMPL)
-            _engine = Qwen3TTSModel.from_pretrained(
-                MODEL_ID, device_map=DEVICE, dtype=getattr(torch, DTYPE), attn_implementation=ATTN_IMPL,
-            )
-            _base = _engine
-        else:
-            raise ValueError(f"BACKEND must be 'faster' or 'stock', got {BACKEND!r}")
-
-        if getattr(_base.model, "tts_model_type", "base") != "base":
-            raise RuntimeError(f"{MODEL_ID} is not a Base (voice clone) model")
-
-        # one short real generation so the first request isn't slow
-        warm = (np.full(24000, 1e-4, dtype=np.float32), 24000)
-        with torch.inference_mode():
-            prompt = _base.create_voice_clone_prompt(ref_audio=warm, x_vector_only_mode=True)
-            _, _sample_rate = _call_engine("Ready.", "English", prompt, {"max_new_tokens": 32})
-        vram = f", {torch.cuda.memory_allocated() / 1024**3:.2f} GB VRAM allocated" if torch.cuda.is_available() else ""
-        log.info("model ready (%s backend) in %.1fs%s", BACKEND, time.time() - t0, vram)
-    except Exception as e:  # keep the process alive so /healthz can report the error
-        _engine = _base = None
-        _model_error = f"{type(e).__name__}: {e}"
-        log.exception("model failed to load")
-
-
-def _call_engine(text: str, language: str, prompt, kw: dict):
-    """One generation call, adapting sampling kwargs to the backend."""
-    if BACKEND == "faster":
-        # faster-qwen3-tts takes these directly; its sub-talker sampling is fixed at graph capture
-        allowed = ("temperature", "top_p", "top_k", "repetition_penalty", "max_new_tokens")
-        args = {k: v for k, v in kw.items() if k in allowed}
-        if "max_new_tokens" in args:
-            args["max_new_tokens"] = min(args["max_new_tokens"], MAX_SEQ_LEN)
-        wavs, sr = _engine.generate_voice_clone(text=text, language=language, voice_clone_prompt=prompt, **args)
-    else:
-        args = dict(kw)
-        # keep the sub-talker (residual codebooks) in step with the main temperature/top_p
-        if "temperature" in args:
-            args["subtalker_temperature"] = args["temperature"]
-        if "top_p" in args:
-            args["subtalker_top_p"] = args["top_p"]
-        wavs, sr = _engine.generate_voice_clone(text=text, language=language, voice_clone_prompt=prompt, **args)
-    return np.asarray(wavs[0], dtype=np.float32).reshape(-1), int(sr)
-
-
-# --------------------------------------------------------------------------- voices on disk
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+    except Exception:
+        log.warning("unreadable %s", path)
+        return default
 
 
 def _voice_dir(name: str) -> Path:
@@ -160,27 +232,23 @@ def _voice_dir(name: str) -> Path:
 
 
 def _read_meta(name: str) -> dict:
-    meta_path = _voice_dir(name) / "meta.json"
-    if not meta_path.exists():
+    meta = _read_json(_voice_dir(name) / "meta.json", None)
+    if meta is None:
         raise HTTPException(404, f"voice '{name}' not found")
-    return json.loads(meta_path.read_text())
+    return meta
 
 
 def _list_voices() -> list[dict]:
     out = []
     if VOICES_DIR.exists():
-        for d in sorted(VOICES_DIR.iterdir()):
-            m = d / "meta.json"
-            if d.is_dir() and m.exists():
-                try:
-                    out.append(json.loads(m.read_text()))
-                except Exception:
-                    log.warning("bad meta.json in %s", d)
+        for d in sorted(VOICES_DIR.iterdir(), key=lambda p: p.name.lower()):
+            meta = _read_json(d / "meta.json", None) if d.is_dir() else None
+            if meta:
+                out.append(meta)
     return out
 
 
 def _to_ref_wav(src: Path, dst: Path) -> float:
-    """Convert any audio ffmpeg can read to 24 kHz mono 16-bit WAV. Returns duration in seconds."""
     cmd = ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", str(src),
            "-ac", "1", "-ar", "24000", "-sample_fmt", "s16", str(dst)]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -191,7 +259,7 @@ def _to_ref_wav(src: Path, dst: Path) -> float:
 
 
 async def _save_upload(upload: UploadFile, workdir: Path) -> Path:
-    raw = workdir / ("upload" + Path(upload.filename or "audio").suffix)
+    raw = workdir / ("upload" + Path(upload.filename or "audio").suffix[:10])
     with raw.open("wb") as f:
         shutil.copyfileobj(upload.file, f)
     if raw.stat().st_size == 0:
@@ -199,121 +267,16 @@ async def _save_upload(upload: UploadFile, workdir: Path) -> Path:
     return raw
 
 
-def _build_prompt(ref_wav: str, ref_text: str):
-    """Voice-clone prompt from a reference clip. Runs on the GPU thread."""
-    audio, sr = sf.read(ref_wav, dtype="float32", always_2d=False)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    icl = bool(ref_text)
-    if icl and REF_TAIL_SILENCE > 0:
-        audio = np.concatenate([audio, np.zeros(int(REF_TAIL_SILENCE * sr), dtype=np.float32)])
-    with torch.inference_mode():
-        return _base.create_voice_clone_prompt(
-            ref_audio=(audio, int(sr)), ref_text=ref_text or None, x_vector_only_mode=not icl,
-        )
+MEDIA = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
+         "opus": "audio/ogg", "aac": "audio/aac", "pcm": "audio/L16"}
 
 
-def _get_prompt(name: str):
-    """Cached prompt for a saved voice. Runs on the GPU thread."""
-    if name not in _prompt_cache:
-        meta = _read_meta(name)
-        _prompt_cache[name] = _build_prompt(str(_voice_dir(name) / "ref.wav"), meta.get("ref_text", ""))
-    return _prompt_cache[name]
-
-
-# --------------------------------------------------------------------------- generation
-
-
-def _split_text(text: str, limit: int) -> list[str]:
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) <= limit:
-        return [text]
-    sentences = re.split(r"(?<=[.!?。！？;])\s+", text)
-    chunks, cur = [], ""
-    for s in sentences:
-        while len(s) > limit:  # a single very long sentence: break on commas, then hard
-            cut = s.rfind(",", 0, limit)
-            cut = cut + 1 if cut > limit // 3 else limit
-            chunks.append(s[:cut].strip())
-            s = s[cut:].strip()
-        if s and not re.search(r"\w", s) and (cur or chunks):   # stray punctuation left by a hard cut
-            if cur:
-                cur += s
-            else:
-                chunks[-1] += s
-            continue
-        if cur and len(cur) + 1 + len(s) > limit:
-            chunks.append(cur)
-            cur = s
-        else:
-            cur = f"{cur} {s}".strip()
-    if cur:
-        chunks.append(cur)
-    return [c for c in chunks if c]
-
-
-class GenParams(BaseModel):
-    temperature: Optional[float] = Field(None, ge=0.05, le=2.0)
-    top_p: Optional[float] = Field(None, gt=0.0, le=1.0)
-    top_k: Optional[int] = Field(None, ge=1, le=500)
-    repetition_penalty: Optional[float] = Field(None, ge=1.0, le=2.0)
-    max_new_tokens: Optional[int] = Field(None, ge=16, le=4096)
-    seed: Optional[int] = None
-
-    def kwargs(self) -> dict:
-        fields = ("temperature", "top_p", "top_k", "repetition_penalty", "max_new_tokens")
-        return {k: getattr(self, k) for k in fields if getattr(self, k) is not None}
-
-
-def _generate(text: str, language: str, params: GenParams, prompt) -> np.ndarray:
-    """Runs on the GPU thread."""
-    if _engine is None:
-        raise HTTPException(503, _model_error or "model is still loading")
-    chunks = _split_text(text, CHUNK_CHARS)
-    gap = np.zeros(int(_sample_rate * CHUNK_GAP_MS / 1000), dtype=np.float32)
-    if params.seed is not None:
-        torch.manual_seed(params.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(params.seed)
-    t0 = time.time()
-    pieces: list[np.ndarray] = []
-    with torch.inference_mode():
-        for i, chunk in enumerate(chunks):
-            wav, _ = _call_engine(chunk, language, prompt, params.kwargs())
-            if i:
-                pieces.append(gap)
-            pieces.append(wav)
-    audio = np.concatenate(pieces) if pieces else np.zeros(1, dtype=np.float32)
-    secs, took = len(audio) / _sample_rate, time.time() - t0
-    log.info("generated %.1fs audio in %.1fs (%.2fx real time, %d chunk%s)", secs, took,
-             secs / took if took else 0, len(chunks), "" if len(chunks) == 1 else "s")
-    return audio
-
-
-def _clone_once(ref_wav: str, ref_text: str, text: str, language: str, params: GenParams) -> np.ndarray:
-    """Runs on the GPU thread."""
-    if _engine is None:
-        raise HTTPException(503, _model_error or "model is still loading")
-    return _generate(text, language, params, _build_prompt(ref_wav, ref_text))
-
-
-MEDIA = {
-    "wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
-    "opus": "audio/ogg", "aac": "audio/aac", "pcm": "audio/L16",
-}
-
-
-def _encode(audio: np.ndarray, fmt: str, speed: float) -> bytes:
+def _encode(wav: bytes, fmt: str, speed: float) -> bytes:
     fmt = fmt.lower()
     if fmt not in MEDIA:
         raise HTTPException(400, f"response_format must be one of {sorted(MEDIA)}")
-    audio = np.clip(audio, -1.0, 1.0)
-    buf = io.BytesIO()
-    sf.write(buf, audio, _sample_rate, format="WAV", subtype="PCM_16")
-    wav = buf.getvalue()
     if fmt == "wav" and abs(speed - 1.0) < 1e-3:
         return wav
-    # atempo accepts 0.5..2.0 per stage; chain stages for anything beyond that
     filters, s = [], max(0.25, min(4.0, speed))
     while s > 2.0:
         filters.append("atempo=2.0"); s /= 2.0
@@ -321,30 +284,66 @@ def _encode(audio: np.ndarray, fmt: str, speed: float) -> bytes:
         filters.append("atempo=0.5"); s /= 0.5
     if abs(s - 1.0) > 1e-3:
         filters.append(f"atempo={s:.4f}")
-    out = {
-        "wav": ["-f", "wav"], "mp3": ["-f", "mp3", "-b:a", "128k"], "flac": ["-f", "flac"],
-        "opus": ["-f", "ogg", "-c:a", "libopus", "-b:a", "64k"], "aac": ["-f", "adts", "-c:a", "aac", "-b:a", "128k"],
-        "pcm": ["-f", "s16le", "-ac", "1", "-ar", str(_sample_rate)],
-    }[fmt]
+    out = {"wav": ["-f", "wav"], "mp3": ["-f", "mp3", "-b:a", "128k"], "flac": ["-f", "flac"],
+           "opus": ["-f", "ogg", "-c:a", "libopus", "-b:a", "64k"],
+           "aac": ["-f", "adts", "-c:a", "aac", "-b:a", "128k"],
+           "pcm": ["-f", "s16le", "-ac", "1", "-ar", "24000"]}[fmt]
     cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "wav", "-i", "pipe:0"]
     if filters:
         cmd += ["-filter:a", ",".join(filters)]
-    cmd += out + ["pipe:1"]
-    r = subprocess.run(cmd, input=wav, capture_output=True)
+    r = subprocess.run(cmd + out + ["pipe:1"], input=wav, capture_output=True)
     if r.returncode != 0:
         raise HTTPException(500, f"encoding failed: {r.stderr.decode()[:300]}")
     return r.stdout
 
 
+def _list_generations() -> list[dict]:
+    items = []
+    if GEN_DIR.exists():
+        for m in GEN_DIR.glob("*.json"):
+            meta = _read_json(m, None)
+            if meta and (GEN_DIR / f"{meta['id']}.wav").exists():
+                items.append(meta)
+    return sorted(items, key=lambda x: x.get("created", 0), reverse=True)
+
+
+def _save_generation(wav: bytes, meta: dict) -> dict:
+    GEN_DIR.mkdir(parents=True, exist_ok=True)
+    gid = uuid.uuid4().hex[:12]
+    (GEN_DIR / f"{gid}.wav").write_bytes(wav)
+    meta = {"id": gid, "created": time.time(), **meta}
+    _write_json(GEN_DIR / f"{gid}.json", meta)
+    for old in _list_generations()[MAX_GENERATIONS:]:
+        _delete_generation(old["id"])
+    return meta
+
+
+def _delete_generation(gid: str) -> None:
+    for ext in ("wav", "json"):
+        (GEN_DIR / f"{gid}.{ext}").unlink(missing_ok=True)
+
+
 # --------------------------------------------------------------------------- app
 
-app = FastAPI(title="Qwen3-TTS", version="1.1")
+app = FastAPI(title="Qwen3-TTS", version="2.0")
 
 
 @app.on_event("startup")
-def _startup() -> None:
-    VOICES_DIR.mkdir(parents=True, exist_ok=True)
-    _gpu.submit(_load_model)
+async def _startup() -> None:
+    for d in (VOICES_DIR, GEN_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    engine = _read_json(STATE_FILE, {}).get("engine", DEFAULT_ENGINE)
+    if engine not in ENGINES or not Path(ENGINES[engine]["python"]).exists():
+        engine = DEFAULT_ENGINE
+    try:
+        await engines.start(engine)
+    except HTTPException as e:
+        engines.status, engines.error = "error", e.detail
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    await engines._stop()
 
 
 @app.get("/livez")
@@ -354,26 +353,37 @@ def livez():
 
 @app.get("/healthz")
 def healthz():
-    if _engine is not None:
-        info = {"ok": True, "model": MODEL_ID, "backend": BACKEND, "device": DEVICE}
-        if torch.cuda.is_available():
-            info["vram_allocated_gb"] = round(torch.cuda.memory_allocated() / 1024**3, 2)
-        return info
-    status = 500 if _model_error else 503
-    return JSONResponse({"ok": False, "backend": BACKEND, "error": _model_error or "loading"}, status_code=status)
+    s = engines.snapshot()
+    return JSONResponse({"ok": s["status"] == "ready", **s}, status_code=200 if s["status"] == "ready" else 503)
+
+
+@app.get("/v1/engine")
+def get_engine():
+    return engines.snapshot()
+
+
+class EngineSwitch(BaseModel):
+    engine: str
+
+
+@app.post("/v1/engine")
+async def set_engine(req: EngineSwitch):
+    if req.engine == engines.engine and engines.status in ("starting", "ready"):
+        return engines.snapshot()
+    await engines.start(req.engine)
+    return engines.snapshot()
 
 
 @app.get("/v1/info")
 def info():
-    langs = []
-    if _base is not None:
-        try:
-            langs = sorted(_base.model.get_supported_languages() or [])
-        except Exception:
-            pass
-    return {"model": MODEL_ID, "backend": BACKEND, "ready": _engine is not None, "error": _model_error,
-            "languages": ["Auto", *[str(l).capitalize() for l in langs if str(l).lower() != "auto"]],
-            "default_voice": DEFAULT_VOICE, "formats": sorted(MEDIA)}
+    langs = engines.health.get("languages") or []
+    if langs:
+        langs = ["Auto", *[l.capitalize() for l in langs if l.lower() != "auto"]]
+    return {"model": MODEL_ID, "languages": langs or LANGUAGES, "default_voice": DEFAULT_VOICE,
+            "formats": sorted(MEDIA), "engine": engines.snapshot()}
+
+
+# ---- voices
 
 
 @app.get("/v1/audio/voices")
@@ -384,16 +394,11 @@ def voices():
 
 
 @app.post("/v1/voices")
-async def create_voice(
-    name: str = Form(...),
-    file: UploadFile = File(...),
-    ref_text: str = Form(""),
-    language: str = Form("Auto"),
-    overwrite: bool = Form(False),
-):
+async def create_voice(name: str = Form(...), file: UploadFile = File(...), ref_text: str = Form(""),
+                       language: str = Form("Auto"), overwrite: bool = Form(False)):
     d = _voice_dir(name)
     if d.exists() and not overwrite:
-        raise HTTPException(409, f"voice '{name}' already exists (send overwrite=true to replace)")
+        raise HTTPException(409, f"voice '{name}' already exists (tick 'Replace' to overwrite)")
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         raw = await _save_upload(file, tmp)
@@ -408,10 +413,8 @@ async def create_voice(
     meta = {"name": name, "ref_text": ref_text.strip(), "language": language,
             "mode": "icl" if ref_text.strip() else "x_vector_only",
             "duration_s": round(dur, 2), "created": int(time.time())}
-    (d / "meta.json").write_text(json.dumps(meta, indent=2))
-    _prompt_cache.pop(name, None)
-    if _engine is not None:
-        await on_gpu(_get_prompt, name)   # validate + warm the cache now
+    _write_json(d / "meta.json", meta)
+    await engines.warm(d / "ref.wav", meta["ref_text"])
     return meta
 
 
@@ -421,7 +424,6 @@ def delete_voice(name: str):
     if not d.exists():
         raise HTTPException(404, f"voice '{name}' not found")
     shutil.rmtree(d)
-    _prompt_cache.pop(name, None)
     return {"deleted": name}
 
 
@@ -433,70 +435,169 @@ def voice_reference(name: str):
     return FileResponse(p, media_type="audio/wav")
 
 
-class SpeechRequest(GenParams):
+# ---- speech
+
+
+class SpeechRequest(BaseModel):
     input: str = Field(..., min_length=1)
     voice: Optional[str] = None
-    model: Optional[str] = None             # accepted for OpenAI compatibility, ignored
+    model: Optional[str] = None             # OpenAI compatibility, ignored
+    instructions: Optional[str] = None      # OpenAI compatibility, ignored (Base model)
     response_format: str = "mp3"
     speed: float = Field(1.0, ge=0.25, le=4.0)
     language: Optional[str] = None
-    instructions: Optional[str] = None      # accepted for OpenAI compatibility, ignored (Base model)
+    temperature: Optional[float] = Field(None, ge=0.05, le=2.0)
+    top_p: Optional[float] = Field(None, gt=0.0, le=1.0)
+    top_k: Optional[int] = Field(None, ge=1, le=500)
+    repetition_penalty: Optional[float] = Field(None, ge=1.0, le=2.0)
+    max_new_tokens: Optional[int] = Field(None, ge=16, le=4096)
+    seed: Optional[int] = None
+    save: bool = False                      # keep it in the UI's generation history
+
+    def params(self) -> dict:
+        keys = ("temperature", "top_p", "top_k", "repetition_penalty", "max_new_tokens")
+        return {k: getattr(self, k) for k in keys if getattr(self, k) is not None}
+
+
+def _audio_headers(stats: dict, gen: Optional[dict]) -> dict:
+    h = {"X-Engine": stats["engine"], "X-Gen-Seconds": f"{stats['gen_seconds']:.2f}",
+         "X-Audio-Seconds": f"{stats['audio_seconds']:.2f}",
+         "Access-Control-Expose-Headers": "X-Engine, X-Gen-Seconds, X-Audio-Seconds, X-Generation-Id"}
+    if gen:
+        h["X-Generation-Id"] = gen["id"]
+    return h
 
 
 @app.post("/v1/audio/speech")
 async def speech(req: SpeechRequest):
     if len(req.input) > MAX_INPUT_CHARS:
         raise HTTPException(413, f"input is over {MAX_INPUT_CHARS} characters")
+    fmt = req.response_format.lower()
+    if fmt not in MEDIA:
+        raise HTTPException(400, f"response_format must be one of {sorted(MEDIA)}")
     name = req.voice or DEFAULT_VOICE
     if not name:
         v = _list_voices()
         if not v:
             raise HTTPException(400, "no voices saved yet: POST /v1/voices first")
         name = v[0]["name"]
-    if _engine is None:
-        raise HTTPException(503, _model_error or "model is still loading")
     meta = _read_meta(name)
     language = req.language or meta.get("language") or DEFAULT_LANGUAGE
-    prompt = await on_gpu(_get_prompt, name)
-    audio = await on_gpu(_generate, req.input, language, req, prompt)
-    data = await run_in_threadpool(_encode, audio, req.response_format, req.speed)
-    return Response(data, media_type=MEDIA[req.response_format.lower()],
-                    headers={"Content-Disposition": f'inline; filename="speech.{req.response_format.lower()}"'})
+    wav, stats = await engines.generate(_voice_dir(name) / "ref.wav", meta.get("ref_text", ""),
+                                        req.input, language, req.params(), req.seed)
+    gen = None
+    if req.save:
+        kept = await run_in_threadpool(_encode, wav, "wav", req.speed)
+        gen = await run_in_threadpool(_save_generation, kept, {
+            "text": req.input, "voice": name, "language": language, "engine": stats["engine"],
+            "params": {**req.params(), "speed": req.speed, "seed": req.seed},
+            "gen_seconds": round(stats["gen_seconds"], 2), "audio_seconds": round(stats["audio_seconds"] / req.speed, 2)})
+    data = await run_in_threadpool(_encode, wav, fmt, req.speed)
+    return Response(data, media_type=MEDIA[fmt], headers={
+        **_audio_headers(stats, gen), "Content-Disposition": f'inline; filename="speech.{fmt}"'})
 
 
 @app.post("/v1/audio/clone")
-async def clone_once(
-    file: UploadFile = File(...),
-    text: str = Form(...),
-    ref_text: str = Form(""),
-    language: str = Form(DEFAULT_LANGUAGE),
-    response_format: str = Form("wav"),
-    speed: float = Form(1.0),
-    temperature: Optional[float] = Form(None),
-    top_p: Optional[float] = Form(None),
-    top_k: Optional[int] = Form(None),
-    repetition_penalty: Optional[float] = Form(None),
-    seed: Optional[int] = Form(None),
-):
+async def clone_once(file: UploadFile = File(...), text: str = Form(...), ref_text: str = Form(""),
+                     language: str = Form(DEFAULT_LANGUAGE), response_format: str = Form("wav"),
+                     speed: float = Form(1.0), temperature: Optional[float] = Form(None),
+                     top_p: Optional[float] = Form(None), top_k: Optional[int] = Form(None),
+                     repetition_penalty: Optional[float] = Form(None), seed: Optional[int] = Form(None)):
     if len(text) > MAX_INPUT_CHARS:
         raise HTTPException(413, f"text is over {MAX_INPUT_CHARS} characters")
-    params = GenParams(temperature=temperature, top_p=top_p, top_k=top_k,
-                       repetition_penalty=repetition_penalty, seed=seed)
-    with tempfile.TemporaryDirectory() as tmp:
+    params = {k: v for k, v in dict(temperature=temperature, top_p=top_p, top_k=top_k,
+                                    repetition_penalty=repetition_penalty).items() if v is not None}
+    with tempfile.TemporaryDirectory(dir=DATA_DIR) as tmp:   # on the PVC so the worker can read it
         tmp = Path(tmp)
         raw = await _save_upload(file, tmp)
-        wav = tmp / "ref.wav"
-        dur = await run_in_threadpool(_to_ref_wav, raw, wav)
+        wav_path = tmp / "ref.wav"
+        dur = await run_in_threadpool(_to_ref_wav, raw, wav_path)
         if dur > MAX_REF_SECONDS:
             raise HTTPException(400, f"reference is {dur:.1f}s; keep it under {MAX_REF_SECONDS:.0f}s")
-        audio = await on_gpu(_clone_once, str(wav), ref_text.strip(), text, language, params)
-    data = await run_in_threadpool(_encode, audio, response_format, speed)
-    return Response(data, media_type=MEDIA[response_format.lower()])
+        wav, stats = await engines.generate(wav_path, ref_text.strip(), text, language, params, seed)
+    data = await run_in_threadpool(_encode, wav, response_format, speed)
+    return Response(data, media_type=MEDIA[response_format.lower()], headers=_audio_headers(stats, None))
+
+
+# ---- generations
+
+
+@app.get("/v1/generations")
+def generations():
+    return {"generations": _list_generations()}
+
+
+@app.get("/v1/generations/{gid}/audio")
+def generation_audio(gid: str):
+    p = GEN_DIR / f"{gid}.wav"
+    if not GEN_ID_RE.match(gid) or not p.exists():
+        raise HTTPException(404, "generation not found")
+    return FileResponse(p, media_type="audio/wav", filename=f"qwen3-tts-{gid}.wav")
+
+
+@app.delete("/v1/generations/{gid}")
+def delete_generation(gid: str):
+    if gid == "all":
+        n = 0
+        for g in _list_generations():
+            _delete_generation(g["id"]); n += 1
+        return {"deleted": n}
+    if not GEN_ID_RE.match(gid) or not (GEN_DIR / f"{gid}.json").exists():
+        raise HTTPException(404, "generation not found")
+    _delete_generation(gid)
+    return {"deleted": gid}
+
+
+# ---- presets
+
+
+class Preset(BaseModel):
+    voice: Optional[str] = None
+    language: Optional[str] = None
+    engine: Optional[str] = None
+    response_format: Optional[str] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    repetition_penalty: Optional[float] = None
+    speed: Optional[float] = None
+    seed: Optional[int] = None
+    text: Optional[str] = None
+
+
+@app.get("/v1/presets")
+def presets():
+    data = _read_json(PRESETS_FILE, {})
+    return {"presets": [{"name": k, **v} for k, v in sorted(data.items(), key=lambda kv: kv[0].lower())]}
+
+
+@app.put("/v1/presets/{name}")
+def save_preset(name: str, preset: Preset):
+    name = name.strip()
+    if not PRESET_RE.match(name):
+        raise HTTPException(400, "preset name: 1–64 characters, no slashes")
+    data = _read_json(PRESETS_FILE, {})
+    data[name] = preset.model_dump(exclude_none=True)
+    _write_json(PRESETS_FILE, data)
+    return {"name": name, **data[name]}
+
+
+@app.delete("/v1/presets/{name}")
+def delete_preset(name: str):
+    data = _read_json(PRESETS_FILE, {})
+    if name not in data:
+        raise HTTPException(404, f"preset '{name}' not found")
+    del data[name]
+    _write_json(PRESETS_FILE, data)
+    return {"deleted": name}
+
+
+# ---- UI
 
 
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

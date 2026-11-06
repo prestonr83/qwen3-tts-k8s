@@ -60,6 +60,13 @@ spec:
             # Swap to Qwen/Qwen3-TTS-12Hz-0.6B-Base if VRAM gets tight.
             - name: MODEL_ID
               value: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+            # Engine loaded on first start: fast (faster-qwen3-tts) or original (qwen-tts 0.1.1,
+            # the first deployment). After that the UI toggle wins; the choice is kept in /data/state.json.
+            - name: ENGINE
+              value: fast
+            # fast engine: static KV cache size (reference + text + output tokens per chunk)
+            - name: MAX_SEQ_LEN
+              value: "2048"
             - name: DTYPE
               value: bfloat16
             - name: ATTN_IMPL
@@ -71,8 +78,6 @@ spec:
               value: ""
             - name: HF_HOME
               value: /models
-            - name: HF_HUB_ENABLE_HF_TRANSFER
-              value: "1"
             - name: PYTORCH_CUDA_ALLOC_CONF
               value: expandable_segments:True
             - name: NVIDIA_DRIVER_CAPABILITIES
@@ -87,8 +92,10 @@ spec:
           volumeMounts:
             - { name: models, mountPath: /models }
             - { name: data,   mountPath: /data }
-          # The process answers /livez right away; /healthz turns 200 once the model is
-          # downloaded and loaded. The first start downloads ~5 GB, so allow up to 20 minutes.
+          # All probes use /livez (the web server). The model runs in a worker process that is
+          # restarted when you switch engines, so readiness must not depend on it: otherwise the
+          # pod would drop out of the Service, and the UI with it, during every switch.
+          # /healthz still reports whether the active engine is ready.
           startupProbe:
             httpGet: { path: /livez, port: http }
             periodSeconds: 10
@@ -99,7 +106,7 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 6
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet: { path: /livez, port: http }
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3

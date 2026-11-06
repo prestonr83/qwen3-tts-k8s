@@ -4,290 +4,704 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Qwen3-TTS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700&display=swap">
 <style>
   :root {
-    --bg: #0f1420; --panel: #182033; --panel2: #1e2840; --line: #2a3550;
-    --text: #e6eaf2; --muted: #93a0bb; --accent: #7c83ff; --accent2: #5a61e6;
-    --ok: #3ecf8e; --warn: #f5b84a; --bad: #ef5d6c;
+    --bg: #0b0f19; --panel: #161c2b; --border: #273043; --input: #212838; --input-border: #323b50;
+    --text: #e5e7eb; --muted: #9aa3b5; --faint: #6b7385;
+    --chip: #4f46e5; --accent: #6366f1; --accent-hover: #4f46e5; --accent-soft: rgba(99,102,241,.16);
+    --wave: #465063; --wave-played: #a5b4fc;
+    --ok: #34d399; --warn: #fbbf24; --bad: #f87171;
+    --radius: 10px;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
-         font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
-  header { display: flex; align-items: center; gap: 12px; padding: 16px 24px; border-bottom: 1px solid var(--line); }
-  header h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .2px; }
-  .pill { font-size: 12px; padding: 2px 10px; border-radius: 99px; background: var(--panel2); color: var(--muted); }
-  .pill.ok { color: var(--ok); } .pill.warn { color: var(--warn); } .pill.bad { color: var(--bad); }
-  header .spacer { flex: 1; }
-  header a { color: var(--muted); text-decoration: none; font-size: 13px; }
-  main { display: grid; grid-template-columns: 340px 1fr; gap: 20px; padding: 20px 24px; max-width: 1280px; margin: 0 auto; }
-  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 16px; } }
-  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin: 0 0 14px; font-weight: 600; }
-  label { display: block; font-size: 12.5px; color: var(--muted); margin: 12px 0 5px; }
+  html, body { background: var(--bg); }
+  body { margin: 0; color: var(--text); font: 15px/1.5 "Source Sans 3", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  button, input, select, textarea { font: inherit; color: inherit; }
+
+  /* header */
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; padding: 14px 24px; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 20px; font-weight: 700; margin: 0; letter-spacing: .1px; }
+  header h1 span { color: var(--muted); font-weight: 500; font-size: 14px; margin-left: 8px; }
+  .spacer { flex: 1; }
+  .seg { display: inline-flex; background: var(--input); border: 1px solid var(--input-border); border-radius: 9px; padding: 3px; gap: 3px; }
+  .seg button { background: transparent; border: 0; border-radius: 7px; padding: 5px 14px; cursor: pointer; color: var(--muted); font-weight: 600; font-size: 14px; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .seg button:not(.on):hover { color: var(--text); background: rgba(255,255,255,.05); }
+  .seg button:disabled { opacity: .45; cursor: not-allowed; }
+  .status { display: inline-flex; align-items: center; gap: 7px; font-size: 13.5px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); animation: pulse 1.2s infinite; } .dot.bad { background: var(--bad); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  header a { color: var(--muted); font-size: 13.5px; text-decoration: none; }
+  header a:hover { color: var(--text); }
+
+  /* layout */
+  main { display: grid; grid-template-columns: minmax(300px, 380px) minmax(0, 1fr); gap: 18px; padding: 20px 24px 40px; max-width: 1400px; margin: 0 auto; }
+  .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  @media (max-width: 920px) { main { grid-template-columns: 1fr; padding: 16px; } header { padding: 12px 16px; } }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px 14px; min-width: 0; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--chip); color: #fff; font-size: 13px; font-weight: 600;
+          padding: 3px 9px; border-radius: 6px; margin-bottom: 10px; line-height: 1.4; }
+  .chip svg { width: 13px; height: 13px; }
+  .panel-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .panel-head .chip { margin-bottom: 0; }
+  .panel-head .spacer { flex: 1; }
+  .sub { font-size: 13px; color: var(--muted); margin: 10px 0 5px; display: block; }
+
   input[type=text], input[type=number], select, textarea {
-    width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
-    border-radius: 8px; padding: 8px 10px; font: inherit; }
-  textarea { resize: vertical; min-height: 140px; }
-  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
-  button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 9px 14px;
-           font: inherit; font-weight: 600; cursor: pointer; }
-  button:hover { background: var(--accent2); }
-  button.ghost { background: var(--panel2); color: var(--text); font-weight: 500; }
-  button.ghost:hover { background: var(--line); }
-  button:disabled { opacity: .5; cursor: progress; }
-  .row { display: flex; gap: 8px; align-items: center; }
-  .row > * { flex: 1; }
-  .voices { list-style: none; margin: 0; padding: 0; }
-  .voices li { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border-radius: 8px; background: var(--panel2); margin-bottom: 6px; }
+    width: 100%; background: var(--input); border: 1px solid var(--input-border); border-radius: 8px; padding: 8px 10px; outline: none; }
+  textarea { resize: vertical; min-height: 96px; line-height: 1.5; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  select { appearance: none; padding-right: 30px; cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%239aa3b5' stroke-width='1.5' fill='none'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 11px center; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .row > .grow { flex: 1; min-width: 0; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  @media (max-width: 560px) { .grid3 { grid-template-columns: 1fr 1fr; } .grid3 > :first-child { grid-column: 1 / -1; } }
+
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; height: 36px; padding: 0 14px; border-radius: 8px;
+         border: 1px solid var(--input-border); background: var(--input); cursor: pointer; font-weight: 600; font-size: 14px; white-space: nowrap; }
+  .btn:hover { border-color: var(--faint); }
+  .btn svg { width: 15px; height: 15px; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { background: var(--accent-hover); }
+  .btn.danger:hover { border-color: var(--bad); color: var(--bad); }
+  .btn.rec { background: #b91c1c; border-color: #b91c1c; color: #fff; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.big { width: 100%; height: 46px; font-size: 16.5px; border-radius: 9px; }
+  .icon { width: 30px; height: 30px; padding: 0; border-radius: 7px; border: 0; background: transparent; color: var(--muted); cursor: pointer;
+          display: inline-flex; align-items: center; justify-content: center; flex: none; }
+  .icon:hover { background: rgba(255,255,255,.07); color: var(--text); }
+  .icon.del:hover { color: var(--bad); }
+  .icon svg { width: 16px; height: 16px; }
+  .icon.on { color: var(--wave-played); }
+  .link { background: none; border: 0; padding: 0; color: var(--muted); cursor: pointer; font-size: 13px; }
+  .link:hover { color: var(--text); text-decoration: underline; }
+
+  /* voices */
+  .voices { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .voices li { display: flex; align-items: center; gap: 6px; padding: 7px 6px 7px 10px; border-radius: 8px; background: var(--input);
+               border: 1px solid transparent; cursor: pointer; }
+  .voices li:hover { border-color: var(--input-border); }
+  .voices li.sel { border-color: var(--accent); background: var(--accent-soft); }
   .voices .nm { flex: 1; min-width: 0; }
-  .voices .nm b { display: block; font-weight: 600; }
-  .voices .nm small { color: var(--muted); }
-  .icon { background: transparent; color: var(--muted); padding: 4px 8px; font-weight: 500; }
-  .icon:hover { background: var(--line); color: var(--text); }
-  .empty { color: var(--muted); font-size: 13px; padding: 4px 0 8px; }
-  hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
-  .sliders { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 20px; }
-  .sl label { display: flex; justify-content: space-between; }
-  .sl output { color: var(--text); }
-  input[type=range] { width: 100%; accent-color: var(--accent); }
-  details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 14px; }
-  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
-  .out { margin-top: 18px; }
-  .clip { background: var(--panel2); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
-  .clip .meta { font-size: 12px; color: var(--muted); display: flex; gap: 10px; margin-bottom: 6px; }
-  .clip .meta span:first-child { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  audio { width: 100%; height: 36px; }
-  .err { color: var(--bad); font-size: 13px; margin-top: 10px; white-space: pre-wrap; }
-  .rec { background: var(--bad); }
+  .voices .nm b { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .voices .nm small { color: var(--muted); font-size: 12.5px; }
+  .empty { color: var(--muted); font-size: 14px; padding: 6px 2px; }
+
+  /* reference drop zone */
+  .drop { border: 1.5px dashed var(--input-border); border-radius: 9px; padding: 14px; text-align: center; color: var(--muted); font-size: 13.5px; }
+  .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  .drop .row { justify-content: center; margin-top: 10px; }
+  .drop .btn { min-width: 110px; }
+
+  /* sliders */
+  .sliders { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 22px; }
+  @media (max-width: 560px) { .sliders { grid-template-columns: 1fr; } }
+  .sl label { display: flex; justify-content: space-between; font-size: 13.5px; color: var(--muted); margin: 8px 0 2px; }
+  .sl label output { color: var(--text); font-variant-numeric: tabular-nums; }
+  input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; margin: 10px 0 8px; border-radius: 99px; cursor: pointer;
+    background: linear-gradient(to right, var(--accent) var(--p, 50%), var(--input-border) var(--p, 50%)); outline: none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #fff;
+    border: 3px solid var(--accent); box-shadow: 0 0 0 3px rgba(11,15,25,.6); }
+  input[type=range]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 3px solid var(--accent); }
+  input[type=range]::-moz-range-track { background: transparent; }
+  input[type=range]:focus-visible { box-shadow: 0 0 0 3px var(--accent-soft); }
+  .hint { color: var(--faint); font-size: 12.5px; margin-top: 8px; }
+  details > summary { list-style: none; cursor: pointer; }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary .caret { transition: transform .15s; color: var(--muted); display: inline-flex; }
+  details[open] > summary .caret { transform: rotate(90deg); }
+
+  /* waveform player */
+  .player { background: var(--input); border: 1px solid var(--input-border); border-radius: 9px; padding: 10px 12px 8px; }
+  .player canvas { display: block; width: 100%; height: 72px; cursor: pointer; }
+  .player.compact { padding: 6px 8px; display: flex; align-items: center; gap: 8px; }
+  .player.compact canvas { height: 38px; flex: 1; min-width: 0; }
+  .pctl { display: flex; align-items: center; gap: 4px; margin-top: 6px; }
+  .pctl .time { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .pctl .mid { flex: 1; display: flex; justify-content: center; gap: 4px; }
+  .play { width: 34px; height: 34px; border-radius: 50%; background: var(--text); color: var(--bg); border: 0; cursor: pointer;
+          display: inline-flex; align-items: center; justify-content: center; flex: none; }
+  .play svg { width: 15px; height: 15px; }
+  .play:hover { background: #fff; }
+  .compact .play { width: 28px; height: 28px; }
+  .compact .play svg { width: 12px; height: 12px; }
+  .placeholder { height: 110px; display: flex; align-items: center; justify-content: center; color: var(--faint); }
+  .placeholder svg { width: 26px; height: 26px; }
+
+  .statusbox { background: var(--input); border: 1px solid var(--input-border); border-radius: 8px; padding: 9px 11px; min-height: 40px; font-size: 14px; color: var(--muted); }
+  .statusbox b { color: var(--text); font-weight: 600; }
+  .err { color: var(--bad); font-size: 13.5px; margin-top: 8px; white-space: pre-wrap; }
+  .err:empty { display: none; }
+
+  /* history */
+  .hist { display: flex; flex-direction: column; gap: 10px; }
+  .hitem { background: var(--input); border: 1px solid var(--input-border); border-radius: 9px; padding: 9px 10px 8px; }
+  .hitem .txt { font-size: 14px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .hitem .meta { font-size: 12.5px; color: var(--muted); margin: 3px 0 6px; display: flex; flex-wrap: wrap; gap: 3px 10px; }
+  .hitem .meta .eng { color: var(--wave-played); }
+  .hitem .player { padding: 0; border: 0; background: transparent; }
+  .badge { font-size: 12px; color: var(--muted); background: var(--input); border: 1px solid var(--input-border); border-radius: 99px; padding: 1px 8px; }
+
+  .presets { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 4px; }
+  .presets select { flex: 1 1 160px; min-width: 0; }
+  .presets input { flex: 1 1 140px; min-width: 0; }
+  .toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); background: #1f2638; border: 1px solid var(--input-border);
+           padding: 8px 14px; border-radius: 8px; font-size: 14px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 10; }
+  .toast.show { opacity: 1; }
+  .check { display: flex; align-items: center; gap: 7px; font-size: 13.5px; color: var(--muted); cursor: pointer; }
+  .check input { accent-color: var(--accent); width: 15px; height: 15px; }
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute">
+  <symbol id="i-play" viewBox="0 0 24 24"><path fill="currentColor" d="M7 4.5v15a1 1 0 0 0 1.5.86l12.5-7.5a1 1 0 0 0 0-1.72L8.5 3.64A1 1 0 0 0 7 4.5z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path fill="currentColor" d="M6 4h4v16H6zM14 4h4v16h-4z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect fill="currentColor" x="5" y="5" width="14" height="14" rx="2"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 7h16M10 11v6M14 11v6M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></symbol>
+  <symbol id="i-dl" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 4v11M7 10l5 5 5-5M5 20h14"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path fill="currentColor" d="M11 6v12l-8.5-6zM20.5 6v12L12 12z"/></symbol>
+  <symbol id="i-fwd" viewBox="0 0 24 24"><path fill="currentColor" d="M13 6v12l8.5-6zM3.5 6v12L12 12z"/></symbol>
+  <symbol id="i-music" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M9 18V5l11-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm11-2a3 3 0 1 1-6 0 3 3 0 0 1 6 0z"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM5 11a7 7 0 0 0 14 0M12 18v3"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 16V4M7 9l5-5 5 5M5 20h14"/></symbol>
+  <symbol id="i-text" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M5 6h14M5 12h14M5 18h9"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M4 7h10M18 7h2M4 17h4M12 17h8M16 5v4M10 15v4"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2"/></symbol>
+  <symbol id="i-caret" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14"/></symbol>
+</svg>
+
 <header>
-  <h1>Qwen3-TTS</h1>
-  <span id="status" class="pill warn">loading…</span>
+  <h1>Qwen3-TTS <span>voice clone</span></h1>
+  <div class="seg" id="engineSeg" role="group" aria-label="Engine"></div>
+  <span class="status"><span class="dot" id="engDot"></span><span id="engText">connecting…</span></span>
   <span class="spacer"></span>
   <a href="/docs" target="_blank">API docs</a>
 </header>
 
 <main>
-  <section>
-    <h2>Voices</h2>
-    <ul id="voices" class="voices"></ul>
-    <div id="noVoices" class="empty">No voices yet. Add one below.</div>
-
-    <hr>
-    <h2>Add a voice</h2>
-    <form id="addForm">
-      <label for="vName">Name</label>
-      <input id="vName" type="text" placeholder="preston" required pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}">
-      <label for="vFile">Reference clip (5–20 s of clean speech)</label>
-      <div class="row">
-        <input id="vFile" type="file" accept="audio/*">
-        <button type="button" id="recBtn" class="ghost" style="flex:0 0 auto">Record</button>
+  <!-- LEFT: voices -->
+  <div class="col">
+    <section class="panel">
+      <div class="panel-head">
+        <span class="chip"><svg><use href="#i-user"/></svg>Saved Voices</span>
+        <span class="spacer"></span><span class="badge" id="voiceCount">0</span>
       </div>
-      <div id="recInfo" class="hint"></div>
-      <label for="vText">Transcript of the clip</label>
-      <textarea id="vText" style="min-height:70px" placeholder="Exactly what is said in the clip. Strongly recommended — without it only the speaker embedding is used and the clone is weaker."></textarea>
-      <label for="vLang">Language</label>
-      <select id="vLang" class="langs"></select>
-      <div class="row" style="margin-top:14px">
-        <label style="margin:0;display:flex;gap:6px;align-items:center;flex:1">
-          <input type="checkbox" id="vOverwrite"> Replace if it exists
-        </label>
-        <button type="submit" id="addBtn" style="flex:0 0 auto">Save voice</button>
-      </div>
-      <div id="addErr" class="err"></div>
-    </form>
-  </section>
+      <ul class="voices" id="voices"></ul>
+      <div class="empty" id="noVoices">No voices yet. Add one below.</div>
+    </section>
 
-  <section>
-    <h2>Generate</h2>
-    <form id="genForm">
-      <textarea id="text" placeholder="Type something for the cloned voice to say…" required>Hey, this is a quick test of the new text to speech setup. If it sounds like me, it worked.</textarea>
-      <div class="row">
-        <div><label for="voice">Voice</label><select id="voice"></select></div>
-        <div><label for="lang">Language</label><select id="lang" class="langs"></select></div>
-        <div><label for="fmt">Format</label>
+    <details class="panel" id="addPanel">
+      <summary class="panel-head" style="margin-bottom:0">
+        <span class="chip"><svg><use href="#i-plus"/></svg>Add Voice</span>
+        <span class="spacer"></span><span class="caret"><svg width="16" height="16"><use href="#i-caret"/></svg></span>
+      </summary>
+      <form id="addForm" style="margin-top:12px">
+        <span class="chip"><svg><use href="#i-music"/></svg>Reference Audio</span>
+        <div class="drop" id="drop">
+          <div id="dropMsg">Drop an audio file here, upload one, or record.<br>5–20 s of clean speech from one speaker.</div>
+          <div class="row">
+            <button type="button" class="btn" id="uploadBtn"><svg><use href="#i-up"/></svg>Upload</button>
+            <button type="button" class="btn" id="recBtn"><svg><use href="#i-mic"/></svg><span>Record</span></button>
+          </div>
+          <input type="file" id="vFile" accept="audio/*" hidden>
+        </div>
+        <div id="refPreview" style="display:none">
+          <div class="row" style="margin-bottom:6px"><span class="sub grow" id="refName" style="margin:0"></span>
+            <button type="button" class="icon" id="refClear" title="Remove clip"><svg><use href="#i-x"/></svg></button></div>
+          <div id="refPlayer"></div>
+        </div>
+
+        <span class="sub">Reference text (exact transcript of the clip)</span>
+        <textarea id="vText" style="min-height:76px" placeholder="Exactly what is said in the clip, word for word. Without it only the speaker embedding is used and the clone is much weaker."></textarea>
+        <div class="row" style="margin-top:2px">
+          <div class="grow"><span class="sub">Voice name</span>
+            <input id="vName" type="text" placeholder="macho" required pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}" title="Letters, digits, - _ . (max 64)"></div>
+          <div class="grow"><span class="sub">Language</span><select id="vLang" class="langs"></select></div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <label class="check grow"><input type="checkbox" id="vOverwrite"> Replace if it exists</label>
+          <button type="submit" class="btn primary" id="addBtn">Save voice</button>
+        </div>
+        <div class="err" id="addErr"></div>
+      </form>
+    </details>
+  </div>
+
+  <!-- RIGHT: generate -->
+  <div class="col">
+    <section class="panel">
+      <span class="chip"><svg><use href="#i-text"/></svg>Target Text</span>
+      <textarea id="text" placeholder="Type what the cloned voice should say…">Oh yeah! This is a quick test of the new voice clone. If it sounds right, it worked, brother!</textarea>
+      <div class="grid3" style="margin-top:10px">
+        <div><span class="sub" style="margin-top:0">Voice</span><select id="voice"></select></div>
+        <div><span class="sub" style="margin-top:0">Language</span><select id="lang" class="langs"></select></div>
+        <div><span class="sub" style="margin-top:0">Format</span>
           <select id="fmt"><option>wav</option><option>mp3</option><option>flac</option><option>opus</option></select></div>
       </div>
+    </section>
 
-      <details open>
-        <summary>Generation parameters</summary>
+    <details class="panel" id="paramPanel" open>
+      <summary class="panel-head" style="margin-bottom:0">
+        <span class="chip"><svg><use href="#i-sliders"/></svg>Generation Parameters</span>
+        <span class="spacer"></span><span class="caret"><svg width="16" height="16"><use href="#i-caret"/></svg></span>
+      </summary>
+      <div style="margin-top:12px">
+        <div class="presets">
+          <select id="presetSel" title="Load a saved preset"><option value="">Presets…</option></select>
+          <input type="text" id="presetName" placeholder="Preset name" maxlength="64">
+          <button type="button" class="btn" id="presetSave">Save</button>
+          <button type="button" class="btn danger" id="presetDel" disabled>Delete</button>
+        </div>
+        <div class="hint" style="margin-top:2px">A preset stores the voice, language, format, engine and everything below.</div>
         <div class="sliders">
           <div class="sl"><label>Temperature <output id="o_temperature"></output></label>
-            <input type="range" id="temperature" min="0.1" max="1.5" step="0.05" value="0.9"></div>
+            <input type="range" id="temperature" min="0.1" max="1.5" step="0.05"></div>
           <div class="sl"><label>Top-p <output id="o_top_p"></output></label>
-            <input type="range" id="top_p" min="0.5" max="1" step="0.01" value="1"></div>
+            <input type="range" id="top_p" min="0.5" max="1" step="0.01"></div>
           <div class="sl"><label>Top-k <output id="o_top_k"></output></label>
-            <input type="range" id="top_k" min="5" max="200" step="1" value="50"></div>
+            <input type="range" id="top_k" min="5" max="200" step="1"></div>
           <div class="sl"><label>Repetition penalty <output id="o_repetition_penalty"></output></label>
-            <input type="range" id="repetition_penalty" min="1" max="1.5" step="0.01" value="1.05"></div>
+            <input type="range" id="repetition_penalty" min="1" max="1.5" step="0.01"></div>
           <div class="sl"><label>Speed <output id="o_speed"></output></label>
-            <input type="range" id="speed" min="0.5" max="2" step="0.05" value="1"></div>
-          <div class="sl"><label for="seed">Seed (blank = random)</label>
-            <input type="number" id="seed" placeholder="e.g. 42"></div>
+            <input type="range" id="speed" min="0.5" max="2" step="0.05"></div>
+          <div class="sl"><label for="seed">Seed <output>blank = random</output></label>
+            <div class="row"><input type="number" id="seed" class="grow" placeholder="random">
+              <button type="button" class="btn" id="resetBtn">Reset</button></div></div>
         </div>
-        <div class="hint">Lower temperature = steadier, closer to the reference; higher = more varied delivery. Speed is a time-stretch after generation.</div>
-      </details>
-
-      <div class="row" style="margin-top:16px">
-        <span id="timing" class="hint" style="flex:1"></span>
-        <button type="button" id="resetBtn" class="ghost" style="flex:0 0 auto">Reset</button>
-        <button type="submit" id="genBtn" style="flex:0 0 auto">Generate</button>
+        <div class="hint">Lower temperature stays closer to the reference; higher varies the delivery more. Speed is a time-stretch after generation. Use a fixed seed to compare settings or engines.</div>
       </div>
-      <div id="genErr" class="err"></div>
-    </form>
-    <div id="out" class="out"></div>
-  </section>
+    </details>
+
+    <button class="btn primary big" id="genBtn">Clone &amp; Generate</button>
+    <div class="err" id="genErr" style="margin-top:-6px"></div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <span class="chip"><svg><use href="#i-music"/></svg>Generated Audio</span>
+        <span class="spacer"></span>
+        <a class="icon" id="latestDl" title="Download" style="display:none"><svg><use href="#i-dl"/></svg></a>
+      </div>
+      <div id="latest"><div class="placeholder"><svg><use href="#i-music"/></svg></div></div>
+    </section>
+
+    <section class="panel">
+      <span class="chip">Status</span>
+      <div class="statusbox" id="statusBox">Ready when you are.</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <span class="chip"><svg><use href="#i-clock"/></svg>History</span>
+        <span class="badge" id="histCount">0</span>
+        <span class="spacer"></span>
+        <button class="link" id="clearHist">Clear all</button>
+      </div>
+      <div class="hist" id="hist"></div>
+      <div class="empty" id="noHist">Generated clips are kept here until you delete them.</div>
+      <div style="text-align:center;margin-top:8px"><button class="link" id="moreHist" style="display:none">Show more</button></div>
+    </section>
+  </div>
 </main>
+<div class="toast" id="toast"></div>
 
 <script>
 const $ = id => document.getElementById(id);
-const SLIDERS = ["temperature", "top_p", "top_k", "repetition_penalty", "speed"];
-const DEFAULTS = { temperature: 0.9, top_p: 1, top_k: 50, repetition_penalty: 1.05, speed: 1 };
-let recorded = null;
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const icon = n => `<svg><use href="#i-${n}"/></svg>`;
+const fmtTime = s => { s = Math.max(0, s || 0); const m = Math.floor(s / 60); return `${m}:${String(Math.floor(s % 60)).padStart(2, "0")}`; };
+const store = { get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+                set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 2200); }
+async function api(path, opts = {}) {
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    let msg = r.status + " " + r.statusText;
+    try { const j = await r.json(); msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail || j); } catch {}
+    throw new Error(msg);
+  }
+  return r;
+}
 
-SLIDERS.forEach(id => {
-  const el = $(id), o = $("o_" + id);
-  const show = () => o.textContent = el.value;
-  el.addEventListener("input", show); show();
-});
-$("resetBtn").onclick = () => {
-  SLIDERS.forEach(id => { $(id).value = DEFAULTS[id]; $("o_" + id).textContent = DEFAULTS[id]; });
-  $("seed").value = "";
+/* ---------- playback: only one thing plays at a time ---------- */
+const Playback = {
+  current: null,                       // { audio, onStop }
+  start(audio, onStop) {
+    if (this.current && this.current.audio !== audio) this.stop();
+    this.current = { audio, onStop };
+    audio.play().catch(() => {});
+  },
+  stop() {
+    const c = this.current; this.current = null;
+    if (c) { c.audio.pause(); c.onStop && c.onStop(); }
+  },
+  ended(audio) { if (this.current && this.current.audio === audio) this.current = null; },
 };
 
-async function errText(r) {
-  try { const j = await r.json(); return typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail || j); }
-  catch { return r.status + " " + r.statusText; }
+/* ---------- waveform player ---------- */
+let decodeCtx = null;
+function getDecodeCtx() { return decodeCtx || (decodeCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 1, 44100)); }
+
+class WavePlayer {
+  constructor(host, { compact = false, url = null, blob = null } = {}) {
+    this.compact = compact;
+    this.el = document.createElement("div");
+    this.el.className = "player" + (compact ? " compact" : "");
+    this.audio = new Audio(); this.audio.preload = "metadata";
+    this.peaks = null; this.raf = 0;
+    if (compact) {
+      this.el.innerHTML = `<button class="play" title="Play">${icon("play")}</button><canvas></canvas><span class="time"></span>`;
+    } else {
+      this.el.innerHTML = `<canvas></canvas><div class="pctl"><span class="time cur">0:00</span>
+        <div class="mid"><button class="icon back" title="Back 5 s">${icon("back")}</button>
+        <button class="play" title="Play">${icon("play")}</button>
+        <button class="icon fwd" title="Forward 5 s">${icon("fwd")}</button></div><span class="time dur">0:00</span></div>`;
+      this.el.querySelector(".back").onclick = () => { this.audio.currentTime = Math.max(0, this.audio.currentTime - 5); this.draw(); };
+      this.el.querySelector(".fwd").onclick = () => { this.audio.currentTime = Math.min(this.audio.duration || 0, this.audio.currentTime + 5); this.draw(); };
+    }
+    host.replaceChildren(this.el);
+    this.canvas = this.el.querySelector("canvas");
+    this.btn = this.el.querySelector(".play");
+    this.btn.onclick = () => this.toggle();
+    this.canvas.onclick = e => {
+      if (!this.audio.duration) return;
+      const r = this.canvas.getBoundingClientRect();
+      this.audio.currentTime = ((e.clientX - r.left) / r.width) * this.audio.duration;
+      if (this.audio.paused) this.play(); else this.draw();
+    };
+    this.audio.addEventListener("loadedmetadata", () => this.updateTime());
+    this.audio.addEventListener("ended", () => { Playback.ended(this.audio); this.setPlaying(false); this.audio.currentTime = 0; this.draw(); });
+    this.audio.addEventListener("pause", () => this.setPlaying(false));
+    this.ro = new ResizeObserver(() => this.draw()); this.ro.observe(this.canvas);
+    if (blob) this.load(blob); else if (url) this.load(url);
+  }
+  async load(src) {
+    const blob = src instanceof Blob ? src : await (await fetch(src)).blob();
+    this.url && URL.revokeObjectURL(this.url);
+    this.url = URL.createObjectURL(blob);
+    this.audio.src = this.url;
+    try {
+      const buf = await getDecodeCtx().decodeAudioData(await blob.arrayBuffer());
+      const d = buf.getChannelData(0), n = 600, step = Math.max(1, Math.floor(d.length / n)), peaks = new Float32Array(n);
+      for (let i = 0; i < n; i++) { let m = 0; for (let j = i * step, e = Math.min(d.length, j + step); j < e; j++) { const v = Math.abs(d[j]); if (v > m) m = v; } peaks[i] = m; }
+      const max = Math.max(...peaks) || 1; this.peaks = peaks.map(p => p / max);
+    } catch { this.peaks = null; }
+    this.draw(); this.updateTime();
+    return this;
+  }
+  toggle() { this.audio.paused ? this.play() : Playback.stop(); }
+  play() { Playback.start(this.audio, () => this.setPlaying(false)); this.setPlaying(true); }
+  setPlaying(on) {
+    this.btn.innerHTML = icon(on ? "pause" : "play"); this.btn.title = on ? "Pause" : "Play";
+    cancelAnimationFrame(this.raf);
+    if (on) { const tick = () => { this.draw(); this.updateTime(); this.raf = requestAnimationFrame(tick); }; tick(); } else { this.draw(); this.updateTime(); }
+  }
+  updateTime() {
+    const cur = this.audio.currentTime, dur = this.audio.duration;
+    if (this.compact) this.el.querySelector(".time").textContent = fmtTime(this.audio.paused && !cur ? dur : cur);
+    else { this.el.querySelector(".cur").textContent = fmtTime(cur); this.el.querySelector(".dur").textContent = fmtTime(dur); }
+  }
+  draw() {
+    const c = this.canvas, dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+    if (!w || !h) return;
+    if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+    const g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+    const css = getComputedStyle(document.documentElement);
+    const base = css.getPropertyValue("--wave").trim(), played = css.getPropertyValue("--wave-played").trim();
+    const prog = this.audio.duration ? this.audio.currentTime / this.audio.duration : 0;
+    const bw = this.compact ? 2 : 2.5, gap = this.compact ? 1.5 : 1.5, bars = Math.floor(w / (bw + gap));
+    for (let i = 0; i < bars; i++) {
+      let p = 0.04;
+      if (this.peaks) { const a = Math.floor(i / bars * this.peaks.length), b = Math.max(a + 1, Math.floor((i + 1) / bars * this.peaks.length)); for (let k = a; k < b; k++) p = Math.max(p, this.peaks[k]); }
+      const bh = Math.max(2, p * (h - 4)), x = i * (bw + gap);
+      g.fillStyle = (i + 0.5) / bars <= prog ? played : base;
+      g.beginPath(); g.roundRect ? g.roundRect(x, (h - bh) / 2, bw, bh, 1) : g.rect(x, (h - bh) / 2, bw, bh); g.fill();
+    }
+  }
+  destroy() { if (Playback.current?.audio === this.audio) Playback.stop(); this.ro.disconnect(); cancelAnimationFrame(this.raf); this.url && URL.revokeObjectURL(this.url); }
 }
 
-async function pollStatus() {
-  const s = $("status");
+/* ---------- engine ---------- */
+let engine = { status: "stopped", available: [] }, enginePoll = 0;
+async function refreshEngine() {
+  try { engine = await (await fetch("/v1/engine")).json(); } catch { engine = { status: "offline", available: engine.available || [] }; }
+  renderEngine();
+  clearTimeout(enginePoll);
+  enginePoll = setTimeout(refreshEngine, engine.status === "starting" ? 1500 : 8000);
+}
+function renderEngine() {
+  const seg = $("engineSeg");
+  seg.innerHTML = (engine.available || []).map(e =>
+    `<button data-e="${e.id}" class="${e.id === engine.engine ? "on" : ""}" ${e.installed ? "" : "disabled"} title="${esc(e.desc)}">${esc(e.label)}</button>`).join("");
+  seg.querySelectorAll("button").forEach(b => b.onclick = () => switchEngine(b.dataset.e));
+  const dot = $("engDot"), txt = $("engText"), label = (engine.available || []).find(e => e.id === engine.engine)?.label || engine.engine;
+  const v = engine.versions || {};
+  dot.className = "dot " + ({ ready: "ok", starting: "warn", error: "bad", offline: "bad" }[engine.status] || "");
+  if (engine.status === "ready") txt.textContent = `${label} ready` + (engine.vram_gb != null ? ` · ${engine.vram_gb} GB VRAM` : "") + (v.transformers ? ` · transformers ${v.transformers}` : "");
+  else if (engine.status === "starting") txt.textContent = `Loading ${label}… ${engine.loading_seconds ?? 0}s`;
+  else if (engine.status === "offline") txt.textContent = "server offline";
+  else txt.textContent = `${label}: ${engine.error || engine.status}`;
+  txt.title = engine.error || "";
+  updateGenButton();
+}
+async function switchEngine(id) {
+  if (id === engine.engine && engine.status !== "error") return;
   try {
-    const r = await fetch("/healthz");
-    const j = await r.json();
-    if (r.ok) { s.className = "pill ok"; s.textContent = "ready · " + (j.vram_allocated_gb != null ? j.vram_allocated_gb + " GB VRAM" : j.device); loadInfo(); return; }
-    if (r.status === 500) { s.className = "pill bad"; s.textContent = "error"; s.title = j.error; return; }
-    s.className = "pill warn"; s.textContent = "loading model…";
-  } catch { s.className = "pill bad"; s.textContent = "offline"; }
-  setTimeout(pollStatus, 3000);
+    engine = await (await api("/v1/engine", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ engine: id }) })).json();
+    renderEngine(); refreshEngine(); toast(`Switching to ${id === "fast" ? "Fast" : "Original"} engine…`);
+  } catch (e) { toast(e.message); }
 }
 
-async function loadInfo() {
-  const j = await (await fetch("/v1/info")).json();
-  document.querySelectorAll("select.langs").forEach(sel => {
-    const cur = sel.value;
-    sel.innerHTML = j.languages.map(l => `<option>${l}</option>`).join("");
-    if (cur) sel.value = cur;
-  });
-}
-
-async function loadVoices() {
+/* ---------- voices ---------- */
+let voices = [];
+async function loadVoices(select) {
   const j = await (await fetch("/v1/audio/voices")).json();
-  const ul = $("voices"), sel = $("voice"), cur = sel.value;
-  $("noVoices").style.display = j.details.length ? "none" : "block";
-  ul.innerHTML = ""; sel.innerHTML = "";
-  for (const v of j.details) {
+  voices = j.details;
+  $("voiceCount").textContent = voices.length;
+  $("noVoices").style.display = voices.length ? "none" : "block";
+  if (!voices.length) $("addPanel").open = true;
+  const sel = $("voice"), cur = select || sel.value || store.get("settings", {}).voice;
+  sel.innerHTML = voices.map(v => `<option>${esc(v.name)}</option>`).join("") || `<option value="">(no voices)</option>`;
+  if (cur && voices.some(v => v.name === cur)) sel.value = cur;
+  renderVoiceList();
+}
+let previewAudio = null, previewName = null;
+function renderVoiceList() {
+  const ul = $("voices"); ul.innerHTML = "";
+  for (const v of voices) {
     const li = document.createElement("li");
-    li.innerHTML = `<div class="nm"><b></b><small></small></div>
-      <button class="icon" title="Play reference">▶</button>
-      <button class="icon" title="Delete">✕</button>`;
-    li.querySelector("b").textContent = v.name;
-    li.querySelector("small").textContent = `${v.duration_s}s · ${v.language} · ${v.mode === "icl" ? "with transcript" : "no transcript"}`;
+    li.className = v.name === $("voice").value ? "sel" : "";
+    const playing = previewName === v.name;
+    li.innerHTML = `<div class="nm"><b>${esc(v.name)}</b><small>${v.duration_s}s · ${esc(v.language)} · ${v.mode === "icl" ? "with transcript" : "no transcript"}</small></div>
+      <button class="icon ${playing ? "on" : ""}" title="${playing ? "Stop" : "Play reference"}">${icon(playing ? "stop" : "play")}</button>
+      <button class="icon del" title="Delete voice">${icon("trash")}</button>`;
     const [play, del] = li.querySelectorAll("button");
-    play.onclick = () => new Audio(`/v1/voices/${encodeURIComponent(v.name)}/reference`).play();
+    li.onclick = e => { if (e.target.closest("button")) return; $("voice").value = v.name; if (v.language) $("lang").value = v.language; renderVoiceList(); saveSettings(); };
+    play.onclick = () => togglePreview(v.name);
     del.onclick = async () => {
-      if (!confirm(`Delete voice "${v.name}"?`)) return;
-      await fetch(`/v1/voices/${encodeURIComponent(v.name)}`, { method: "DELETE" });
-      loadVoices();
+      if (!confirm(`Delete voice "${v.name}"? Its reference clip is removed from the server.`)) return;
+      if (previewName === v.name) Playback.stop();
+      try { await api(`/v1/voices/${encodeURIComponent(v.name)}`, { method: "DELETE" }); toast(`Deleted ${v.name}`); loadVoices(); } catch (e) { toast(e.message); }
     };
     ul.appendChild(li);
-    const opt = document.createElement("option"); opt.textContent = v.name; sel.appendChild(opt);
   }
-  if (cur && j.voices.includes(cur)) sel.value = cur;
 }
+function togglePreview(name) {
+  if (previewName === name) { Playback.stop(); return; }
+  previewAudio = previewAudio || new Audio();
+  previewAudio.onended = () => { Playback.ended(previewAudio); previewName = null; renderVoiceList(); };
+  previewAudio.src = `/v1/voices/${encodeURIComponent(name)}/reference`;
+  Playback.start(previewAudio, () => { previewName = null; renderVoiceList(); });
+  previewName = name; renderVoiceList();
+}
+$("voice").onchange = () => { const v = voices.find(x => x.name === $("voice").value); if (v?.language) $("lang").value = v.language; renderVoiceList(); saveSettings(); };
 
-// Microphone recording (works on https:// or http://localhost, e.g. through kubectl port-forward)
-let mediaRec = null;
+/* ---------- reference clip: upload / drop / record ---------- */
+let refBlob = null, refName = "", refPlayer = null, mediaRec = null;
+function setRef(blob, name) {
+  refBlob = blob; refName = name;
+  $("refPreview").style.display = blob ? "block" : "none";
+  $("drop").style.display = blob ? "none" : "block";
+  refPlayer && refPlayer.destroy(); refPlayer = null;
+  if (blob) {
+    $("refName").textContent = name;
+    refPlayer = new WavePlayer($("refPlayer"), { compact: true, blob });
+    if (!$("vName").value) $("vName").value = name.replace(/\.[^.]+$/, "").replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[^A-Za-z0-9]+/, "").slice(0, 64);
+  }
+}
+$("uploadBtn").onclick = () => $("vFile").click();
+$("vFile").onchange = () => { const f = $("vFile").files[0]; if (f) setRef(f, f.name); $("vFile").value = ""; };
+$("refClear").onclick = () => setRef(null, "");
+const drop = $("drop");
+["dragenter", "dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) setRef(f, f.name); });
 $("recBtn").onclick = async () => {
+  const btn = $("recBtn");
   if (mediaRec && mediaRec.state === "recording") { mediaRec.stop(); return; }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const chunks = [];
-    mediaRec = new MediaRecorder(stream);
+    const chunks = []; mediaRec = new MediaRecorder(stream);
     mediaRec.ondataavailable = e => chunks.push(e.data);
     mediaRec.onstop = () => {
       stream.getTracks().forEach(t => t.stop());
-      recorded = new Blob(chunks, { type: mediaRec.mimeType });
-      $("recBtn").textContent = "Record"; $("recBtn").classList.remove("rec");
-      $("recInfo").innerHTML = "";
-      const a = document.createElement("audio"); a.controls = true; a.src = URL.createObjectURL(recorded);
-      $("recInfo").append("Recorded clip (used instead of the file): ", a);
+      btn.classList.remove("rec"); btn.querySelector("span").textContent = "Record"; $("dropMsg").innerHTML = "Drop an audio file here, upload one, or record.<br>5–20 s of clean speech from one speaker.";
+      setRef(new Blob(chunks, { type: mediaRec.mimeType }), "recording.webm");
     };
-    mediaRec.start();
-    $("recBtn").textContent = "Stop"; $("recBtn").classList.add("rec");
-    $("recInfo").textContent = "Recording… read your transcript aloud, then press Stop.";
-  } catch (e) {
-    $("recInfo").textContent = "Microphone unavailable here (needs HTTPS or localhost): " + e.message;
-  }
+    Playback.stop(); mediaRec.start();
+    btn.classList.add("rec"); btn.querySelector("span").textContent = "Stop";
+    $("dropMsg").textContent = "Recording… read your transcript aloud, then press Stop.";
+  } catch (e) { $("addErr").textContent = "Microphone unavailable (it needs HTTPS or localhost): " + e.message; }
 };
-
 $("addForm").onsubmit = async e => {
-  e.preventDefault();
-  $("addErr").textContent = "";
-  const file = recorded || $("vFile").files[0];
-  if (!file) { $("addErr").textContent = "Choose a file or record a clip."; return; }
+  e.preventDefault(); $("addErr").textContent = "";
+  if (!refBlob) { $("addErr").textContent = "Add a reference clip first."; return; }
   const fd = new FormData();
-  fd.append("name", $("vName").value.trim());
-  fd.append("file", file, recorded ? "recording.webm" : file.name);
-  fd.append("ref_text", $("vText").value);
-  fd.append("language", $("vLang").value || "Auto");
+  fd.append("name", $("vName").value.trim()); fd.append("file", refBlob, refName || "clip.wav");
+  fd.append("ref_text", $("vText").value); fd.append("language", $("vLang").value || "Auto");
   fd.append("overwrite", $("vOverwrite").checked);
-  $("addBtn").disabled = true;
+  $("addBtn").disabled = true; $("addBtn").textContent = "Saving…";
   try {
-    const r = await fetch("/v1/voices", { method: "POST", body: fd });
-    if (!r.ok) throw new Error(await errText(r));
-    const v = await r.json();
-    recorded = null; $("recInfo").textContent = ""; $("addForm").reset();
-    await loadVoices(); $("voice").value = v.name;
+    const v = await (await api("/v1/voices", { method: "POST", body: fd })).json();
+    setRef(null, ""); $("addForm").reset(); $("vLang").value = "Auto";
+    await loadVoices(v.name); toast(`Saved voice ${v.name}`); saveSettings();
   } catch (err) { $("addErr").textContent = err.message; }
-  finally { $("addBtn").disabled = false; }
+  finally { $("addBtn").disabled = false; $("addBtn").textContent = "Save voice"; }
 };
 
-$("genForm").onsubmit = async e => {
-  e.preventDefault();
+/* ---------- parameters, settings, presets ---------- */
+const SLIDERS = ["temperature", "top_p", "top_k", "repetition_penalty", "speed"];
+const DEFAULTS = { temperature: 0.9, top_p: 1, top_k: 50, repetition_penalty: 1.05, speed: 1 };
+function paintSlider(el) { el.style.setProperty("--p", ((el.value - el.min) / (el.max - el.min) * 100) + "%"); $("o_" + el.id).textContent = el.value; }
+SLIDERS.forEach(id => { const el = $(id); el.addEventListener("input", () => { paintSlider(el); saveSettings(); }); });
+function setSliders(vals) { SLIDERS.forEach(id => { if (vals[id] != null) { $(id).value = vals[id]; paintSlider($(id)); } }); }
+$("resetBtn").onclick = () => { setSliders(DEFAULTS); $("seed").value = ""; saveSettings(); };
+["seed", "lang", "fmt"].forEach(id => $(id).addEventListener("change", saveSettings));
+function currentSettings() {
+  const s = { voice: $("voice").value || null, language: $("lang").value, response_format: $("fmt").value, engine: engine.engine };
+  SLIDERS.forEach(id => s[id] = +$(id).value);
+  s.seed = $("seed").value === "" ? null : +$("seed").value;
+  return s;
+}
+function saveSettings() { store.set("settings", { ...currentSettings(), text: $("text").value }); }
+$("text").addEventListener("input", () => { clearTimeout(saveSettings.t); saveSettings.t = setTimeout(saveSettings, 400); });
+function applySettings(s) {
+  setSliders(s);
+  if ("seed" in s) $("seed").value = s.seed ?? "";
+  if (s.language) $("lang").value = s.language;
+  if (s.response_format) $("fmt").value = s.response_format;
+  if (s.voice && voices.some(v => v.name === s.voice)) $("voice").value = s.voice;
+  renderVoiceList();
+}
+
+let presets = [];
+async function loadPresets(selectName) {
+  presets = (await (await fetch("/v1/presets")).json()).presets;
+  const sel = $("presetSel");
+  sel.innerHTML = `<option value="">Presets…</option>` + presets.map(p => `<option>${esc(p.name)}</option>`).join("");
+  if (selectName) sel.value = selectName;
+  $("presetDel").disabled = !sel.value;
+}
+$("presetSel").onchange = async () => {
+  const p = presets.find(x => x.name === $("presetSel").value);
+  $("presetDel").disabled = !p; if (!p) return;
+  $("presetName").value = p.name;
+  applySettings(p); saveSettings();
+  if (p.engine && p.engine !== engine.engine) {
+    if (confirm(`Preset "${p.name}" uses the ${p.engine === "fast" ? "Fast" : "Original"} engine. Switch now? (The model reloads.)`)) switchEngine(p.engine);
+  }
+  if (p.voice && !voices.some(v => v.name === p.voice)) toast(`Voice "${p.voice}" no longer exists`);
+  else toast(`Loaded preset ${p.name}`);
+};
+$("presetSave").onclick = async () => {
+  const name = $("presetName").value.trim() || $("presetSel").value;
+  if (!name) { $("presetName").focus(); toast("Name the preset first"); return; }
+  if (presets.some(p => p.name === name) && !confirm(`Overwrite preset "${name}"?`)) return;
+  try {
+    await api(`/v1/presets/${encodeURIComponent(name)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(currentSettings()) });
+    await loadPresets(name); toast(`Saved preset ${name}`);
+  } catch (e) { toast(e.message); }
+};
+$("presetDel").onclick = async () => {
+  const name = $("presetSel").value; if (!name || !confirm(`Delete preset "${name}"?`)) return;
+  try { await api(`/v1/presets/${encodeURIComponent(name)}`, { method: "DELETE" }); $("presetName").value = ""; await loadPresets(); toast(`Deleted preset ${name}`); } catch (e) { toast(e.message); }
+};
+
+async function loadInfo() {
+  const j = await (await fetch("/v1/info")).json();
+  document.querySelectorAll("select.langs").forEach(sel => { const cur = sel.value; sel.innerHTML = j.languages.map(l => `<option>${esc(l)}</option>`).join(""); if (cur) sel.value = cur; });
+}
+
+/* ---------- generate ---------- */
+let busy = false, latestPlayer = null;
+function updateGenButton() {
+  const b = $("genBtn"), ready = engine.status === "ready";
+  b.disabled = busy || !ready;
+  b.textContent = busy ? "Generating…" : ready ? "Clone & Generate" : engine.status === "starting" ? "Waiting for the model to load…" : "Engine not running";
+}
+$("genBtn").onclick = async () => {
   $("genErr").textContent = "";
-  if (!$("voice").value) { $("genErr").textContent = "Add a voice first."; return; }
-  const body = {
-    input: $("text").value, voice: $("voice").value, language: $("lang").value,
-    response_format: $("fmt").value,
-    temperature: +$("temperature").value, top_p: +$("top_p").value, top_k: +$("top_k").value,
-    repetition_penalty: +$("repetition_penalty").value, speed: +$("speed").value,
-  };
-  if ($("seed").value !== "") body.seed = +$("seed").value;
-  $("genBtn").disabled = true; $("timing").textContent = "Generating…";
+  const s = currentSettings();
+  if (!s.voice) { $("genErr").textContent = "Add or pick a voice first."; return; }
+  const text = $("text").value.trim(); if (!text) { $("genErr").textContent = "Type some text first."; return; }
+  const body = { input: text, voice: s.voice, language: s.language, response_format: s.response_format, save: true,
+                 temperature: s.temperature, top_p: s.top_p, top_k: s.top_k, repetition_penalty: s.repetition_penalty, speed: s.speed };
+  if (s.seed != null) body.seed = s.seed;
+  busy = true; updateGenButton(); Playback.stop();
+  $("statusBox").innerHTML = `Generating with the <b>${esc(engine.engine === "fast" ? "Fast" : "Original")}</b> engine…`;
   const t0 = performance.now();
   try {
-    const r = await fetch("/v1/audio/speech", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    if (!r.ok) throw new Error(await errText(r));
-    const blob = await r.blob(), url = URL.createObjectURL(blob);
-    const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    $("timing").textContent = `Done in ${secs}s`;
-    const div = document.createElement("div"); div.className = "clip";
-    div.innerHTML = `<div class="meta"><span></span><span></span><a download>download</a></div><audio controls></audio>`;
-    const [txt, params] = div.querySelectorAll(".meta span");
-    txt.textContent = `${body.voice}: ${body.input}`;
-    params.textContent = `T ${body.temperature} · p ${body.top_p} · k ${body.top_k} · rp ${body.repetition_penalty}${body.seed != null ? " · seed " + body.seed : ""} · ${secs}s`;
-    const a = div.querySelector("a"); a.href = url; a.download = `${body.voice}-${Date.now()}.${body.response_format}`;
-    a.style.color = "var(--accent)";
-    const au = div.querySelector("audio"); au.src = url;
-    $("out").prepend(div); au.play();
-  } catch (err) { $("genErr").textContent = err.message; $("timing").textContent = ""; }
-  finally { $("genBtn").disabled = false; }
+    const r = await api("/v1/audio/speech", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const blob = await r.blob(), wall = (performance.now() - t0) / 1000;
+    const gen = +r.headers.get("x-gen-seconds") || wall, aud = (+r.headers.get("x-audio-seconds") || 0) / s.speed, eng = r.headers.get("x-engine") || engine.engine;
+    latestPlayer && latestPlayer.destroy();
+    latestPlayer = new WavePlayer($("latest"), { blob });
+    const dl = $("latestDl"); dl.style.display = ""; dl.href = latestPlayer.url; dl.download = `${s.voice}-${Date.now()}.${s.response_format}`;
+    $("statusBox").innerHTML = `Generated <b>${aud.toFixed(1)} s</b> of audio in <b>${gen.toFixed(1)} s</b> ` +
+      `(${(aud / gen).toFixed(2)}× real time) with the <b>${eng === "fast" ? "Fast" : "Original"}</b> engine · ${esc(s.voice)} · T ${s.temperature}` +
+      (s.seed != null ? ` · seed ${s.seed}` : "");
+    latestPlayer.play();
+    loadHistory();
+  } catch (err) { $("genErr").textContent = err.message; $("statusBox").textContent = "Generation failed."; }
+  finally { busy = false; updateGenButton(); }
 };
 
-pollStatus(); loadVoices();
+/* ---------- history ---------- */
+let hist = [], histShown = 15, histPlayers = [];
+async function loadHistory() {
+  hist = (await (await fetch("/v1/generations")).json()).generations;
+  renderHistory();
+}
+function renderHistory() {
+  histPlayers.forEach(p => p.destroy()); histPlayers = [];
+  const box = $("hist"); box.innerHTML = "";
+  $("histCount").textContent = hist.length;
+  $("noHist").style.display = hist.length ? "none" : "block";
+  $("clearHist").style.display = hist.length ? "" : "none";
+  $("moreHist").style.display = hist.length > histShown ? "" : "none";
+  for (const g of hist.slice(0, histShown)) {
+    const p = g.params || {}, d = new Date(g.created * 1000);
+    const el = document.createElement("div"); el.className = "hitem";
+    el.innerHTML = `<div class="row" style="align-items:flex-start"><div class="txt grow">${esc(g.text)}</div>
+        <a class="icon" title="Download WAV" href="/v1/generations/${g.id}/audio" download>${icon("dl")}</a>
+        <button class="icon del" title="Delete">${icon("trash")}</button></div>
+      <div class="meta"><span>${esc(g.voice)}</span><span class="eng">${g.engine === "fast" ? "Fast" : "Original"}</span>
+        <span>T ${p.temperature ?? "–"} · p ${p.top_p ?? "–"} · k ${p.top_k ?? "–"} · rp ${p.repetition_penalty ?? "–"}${p.speed && p.speed !== 1 ? " · ×" + p.speed : ""}${p.seed != null ? " · seed " + p.seed : ""}</span>
+        <span>${g.audio_seconds}s in ${g.gen_seconds}s</span><span>${d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}</span></div>
+      <div class="pl"></div>`;
+    el.querySelector(".del").onclick = async () => {
+      try { await api(`/v1/generations/${g.id}`, { method: "DELETE" }); hist = hist.filter(x => x.id !== g.id); renderHistory(); } catch (e) { toast(e.message); }
+    };
+    box.appendChild(el);
+    histPlayers.push(new WavePlayer(el.querySelector(".pl"), { compact: true, url: `/v1/generations/${g.id}/audio` }));
+  }
+}
+$("moreHist").onclick = () => { histShown += 15; renderHistory(); };
+$("clearHist").onclick = async () => {
+  if (!confirm(`Delete all ${hist.length} generated clips?`)) return;
+  try { await api("/v1/generations/all", { method: "DELETE" }); hist = []; renderHistory(); toast("History cleared"); } catch (e) { toast(e.message); }
+};
+
+/* ---------- boot ---------- */
+(async () => {
+  const saved = store.get("settings", {});
+  setSliders({ ...DEFAULTS, ...saved });
+  if (saved.text) $("text").value = saved.text;
+  await refreshEngine();
+  await loadInfo().catch(() => {});
+  await loadVoices().catch(() => {});
+  applySettings(saved);
+  loadPresets().catch(() => {});
+  loadHistory().catch(() => {});
+})();
 </script>
 </body>
 </html>
