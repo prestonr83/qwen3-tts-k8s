@@ -10,6 +10,7 @@ ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
 ARG FASTER_QWEN3_TTS_VERSION=0.5.4
 # transformers 5.21.0 made MimiModel.upsample a read-only property; qwen-tts-hf's 12Hz tokenizer
 # assigns it, so model load fails with "property 'upsample' ... has no setter". Stay on 5.20.x.
+# (app/qwen_compat.py fixes the other incompatibility: the RoPE shim reading config.rope_theta.)
 ARG TRANSFORMERS_VERSION=5.20.2
 
 ENV PYTHONUNBUFFERED=1 \
@@ -38,6 +39,12 @@ RUN useradd -m -u 1000 app && mkdir -p /models /data && chown -R app:app /models
 WORKDIR /app
 COPY --chown=app:app app/ /app/
 USER app
+
+# Fail the build (not the pod) if the RoPE fix stops working with these package versions.
+RUN python -c "import torch, qwen_compat; qwen_compat.apply(); \
+from transformers import MimiConfig; from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS; \
+inv, _ = ROPE_INIT_FUNCTIONS['default'](MimiConfig(hidden_size=512, num_attention_heads=8, rope_theta=10000.0)); \
+assert torch.allclose(inv, 1.0 / (10000.0 ** (torch.arange(0, 64, 2).float() / 64))), 'RoPE fix broken'; print('rope fix ok')"
 
 EXPOSE 8000
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]

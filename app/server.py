@@ -88,6 +88,9 @@ def _load_model() -> None:
     global _engine, _base, _model_error, _sample_rate
     t0 = time.time()
     try:
+        import qwen_compat
+
+        qwen_compat.apply()   # must run before any model is loaded
         if BACKEND == "faster":
             from faster_qwen3_tts import FasterQwen3TTS
 
