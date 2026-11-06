@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: tts
+resources:
+  - qwen3-tts.yaml
+  # - ingressroute.yaml   # uncomment once DNS + TLS secret for qwen-tts.rdz.sh exist
+
+images:
+  - name: ghcr.io/prestonr83/qwen3-tts-server
+    # Pin to the 7-char commit tag the pipeline prints in its run summary,
+    # so a rebuild of :latest never changes what's running without you knowing.
+    newTag: latest

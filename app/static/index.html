@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen3-TTS</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #182033; --panel2: #1e2840; --line: #2a3550;
+    --text: #e6eaf2; --muted: #93a0bb; --accent: #7c83ff; --accent2: #5a61e6;
+    --ok: #3ecf8e; --warn: #f5b84a; --bad: #ef5d6c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 16px 24px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .pill { font-size: 12px; padding: 2px 10px; border-radius: 99px; background: var(--panel2); color: var(--muted); }
+  .pill.ok { color: var(--ok); } .pill.warn { color: var(--warn); } .pill.bad { color: var(--bad); }
+  header .spacer { flex: 1; }
+  header a { color: var(--muted); text-decoration: none; font-size: 13px; }
+  main { display: grid; grid-template-columns: 340px 1fr; gap: 20px; padding: 20px 24px; max-width: 1280px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 16px; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin: 0 0 14px; font-weight: 600; }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin: 12px 0 5px; }
+  input[type=text], input[type=number], select, textarea {
+    width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; font: inherit; }
+  textarea { resize: vertical; min-height: 140px; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 9px 14px;
+           font: inherit; font-weight: 600; cursor: pointer; }
+  button:hover { background: var(--accent2); }
+  button.ghost { background: var(--panel2); color: var(--text); font-weight: 500; }
+  button.ghost:hover { background: var(--line); }
+  button:disabled { opacity: .5; cursor: progress; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row > * { flex: 1; }
+  .voices { list-style: none; margin: 0; padding: 0; }
+  .voices li { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border-radius: 8px; background: var(--panel2); margin-bottom: 6px; }
+  .voices .nm { flex: 1; min-width: 0; }
+  .voices .nm b { display: block; font-weight: 600; }
+  .voices .nm small { color: var(--muted); }
+  .icon { background: transparent; color: var(--muted); padding: 4px 8px; font-weight: 500; }
+  .icon:hover { background: var(--line); color: var(--text); }
+  .empty { color: var(--muted); font-size: 13px; padding: 4px 0 8px; }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
+  .sliders { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 20px; }
+  .sl label { display: flex; justify-content: space-between; }
+  .sl output { color: var(--text); }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 14px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .out { margin-top: 18px; }
+  .clip { background: var(--panel2); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
+  .clip .meta { font-size: 12px; color: var(--muted); display: flex; gap: 10px; margin-bottom: 6px; }
+  .clip .meta span:first-child { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  audio { width: 100%; height: 36px; }
+  .err { color: var(--bad); font-size: 13px; margin-top: 10px; white-space: pre-wrap; }
+  .rec { background: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Qwen3-TTS</h1>
+  <span id="status" class="pill warn">loading…</span>
+  <span class="spacer"></span>
+  <a href="/docs" target="_blank">API docs</a>
+</header>
+
+<main>
+  <section>
+    <h2>Voices</h2>
+    <ul id="voices" class="voices"></ul>
+    <div id="noVoices" class="empty">No voices yet. Add one below.</div>
+
+    <hr>
+    <h2>Add a voice</h2>
+    <form id="addForm">
+      <label for="vName">Name</label>
+      <input id="vName" type="text" placeholder="preston" required pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}">
+      <label for="vFile">Reference clip (5–20 s of clean speech)</label>
+      <div class="row">
+        <input id="vFile" type="file" accept="audio/*">
+        <button type="button" id="recBtn" class="ghost" style="flex:0 0 auto">Record</button>
+      </div>
+      <div id="recInfo" class="hint"></div>
+      <label for="vText">Transcript of the clip</label>
+      <textarea id="vText" style="min-height:70px" placeholder="Exactly what is said in the clip. Strongly recommended — without it only the speaker embedding is used and the clone is weaker."></textarea>
+      <label for="vLang">Language</label>
+      <select id="vLang" class="langs"></select>
+      <div class="row" style="margin-top:14px">
+        <label style="margin:0;display:flex;gap:6px;align-items:center;flex:1">
+          <input type="checkbox" id="vOverwrite"> Replace if it exists
+        </label>
+        <button type="submit" id="addBtn" style="flex:0 0 auto">Save voice</button>
+      </div>
+      <div id="addErr" class="err"></div>
+    </form>
+  </section>
+
+  <section>
+    <h2>Generate</h2>
+    <form id="genForm">
+      <textarea id="text" placeholder="Type something for the cloned voice to say…" required>Hey, this is a quick test of the new text to speech setup. If it sounds like me, it worked.</textarea>
+      <div class="row">
+        <div><label for="voice">Voice</label><select id="voice"></select></div>
+        <div><label for="lang">Language</label><select id="lang" class="langs"></select></div>
+        <div><label for="fmt">Format</label>
+          <select id="fmt"><option>wav</option><option>mp3</option><option>flac</option><option>opus</option></select></div>
+      </div>
+
+      <details open>
+        <summary>Generation parameters</summary>
+        <div class="sliders">
+          <div class="sl"><label>Temperature <output id="o_temperature"></output></label>
+            <input type="range" id="temperature" min="0.1" max="1.5" step="0.05" value="0.9"></div>
+          <div class="sl"><label>Top-p <output id="o_top_p"></output></label>
+            <input type="range" id="top_p" min="0.5" max="1" step="0.01" value="1"></div>
+          <div class="sl"><label>Top-k <output id="o_top_k"></output></label>
+            <input type="range" id="top_k" min="5" max="200" step="1" value="50"></div>
+          <div class="sl"><label>Repetition penalty <output id="o_repetition_penalty"></output></label>
+            <input type="range" id="repetition_penalty" min="1" max="1.5" step="0.01" value="1.05"></div>
+          <div class="sl"><label>Speed <output id="o_speed"></output></label>
+            <input type="range" id="speed" min="0.5" max="2" step="0.05" value="1"></div>
+          <div class="sl"><label for="seed">Seed (blank = random)</label>
+            <input type="number" id="seed" placeholder="e.g. 42"></div>
+        </div>
+        <div class="hint">Lower temperature = steadier, closer to the reference; higher = more varied delivery. Speed is a time-stretch after generation.</div>
+      </details>
+
+      <div class="row" style="margin-top:16px">
+        <span id="timing" class="hint" style="flex:1"></span>
+        <button type="button" id="resetBtn" class="ghost" style="flex:0 0 auto">Reset</button>
+        <button type="submit" id="genBtn" style="flex:0 0 auto">Generate</button>
+      </div>
+      <div id="genErr" class="err"></div>
+    </form>
+    <div id="out" class="out"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const SLIDERS = ["temperature", "top_p", "top_k", "repetition_penalty", "speed"];
+const DEFAULTS = { temperature: 0.9, top_p: 1, top_k: 50, repetition_penalty: 1.05, speed: 1 };
+let recorded = null;
+
+SLIDERS.forEach(id => {
+  const el = $(id), o = $("o_" + id);
+  const show = () => o.textContent = el.value;
+  el.addEventListener("input", show); show();
+});
+$("resetBtn").onclick = () => {
+  SLIDERS.forEach(id => { $(id).value = DEFAULTS[id]; $("o_" + id).textContent = DEFAULTS[id]; });
+  $("seed").value = "";
+};
+
+async function errText(r) {
+  try { const j = await r.json(); return typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail || j); }
+  catch { return r.status + " " + r.statusText; }
+}
+
+async function pollStatus() {
+  const s = $("status");
+  try {
+    const r = await fetch("/healthz");
+    const j = await r.json();
+    if (r.ok) { s.className = "pill ok"; s.textContent = "ready · " + (j.vram_allocated_gb != null ? j.vram_allocated_gb + " GB VRAM" : j.device); loadInfo(); return; }
+    if (r.status === 500) { s.className = "pill bad"; s.textContent = "error"; s.title = j.error; return; }
+    s.className = "pill warn"; s.textContent = "loading model…";
+  } catch { s.className = "pill bad"; s.textContent = "offline"; }
+  setTimeout(pollStatus, 3000);
+}
+
+async function loadInfo() {
+  const j = await (await fetch("/v1/info")).json();
+  document.querySelectorAll("select.langs").forEach(sel => {
+    const cur = sel.value;
+    sel.innerHTML = j.languages.map(l => `<option>${l}</option>`).join("");
+    if (cur) sel.value = cur;
+  });
+}
+
+async function loadVoices() {
+  const j = await (await fetch("/v1/audio/voices")).json();
+  const ul = $("voices"), sel = $("voice"), cur = sel.value;
+  $("noVoices").style.display = j.details.length ? "none" : "block";
+  ul.innerHTML = ""; sel.innerHTML = "";
+  for (const v of j.details) {
+    const li = document.createElement("li");
+    li.innerHTML = `<div class="nm"><b></b><small></small></div>
+      <button class="icon" title="Play reference">▶</button>
+      <button class="icon" title="Delete">✕</button>`;
+    li.querySelector("b").textContent = v.name;
+    li.querySelector("small").textContent = `${v.duration_s}s · ${v.language} · ${v.mode === "icl" ? "with transcript" : "no transcript"}`;
+    const [play, del] = li.querySelectorAll("button");
+    play.onclick = () => new Audio(`/v1/voices/${encodeURIComponent(v.name)}/reference`).play();
+    del.onclick = async () => {
+      if (!confirm(`Delete voice "${v.name}"?`)) return;
+      await fetch(`/v1/voices/${encodeURIComponent(v.name)}`, { method: "DELETE" });
+      loadVoices();
+    };
+    ul.appendChild(li);
+    const opt = document.createElement("option"); opt.textContent = v.name; sel.appendChild(opt);
+  }
+  if (cur && j.voices.includes(cur)) sel.value = cur;
+}
+
+// Microphone recording (works on https:// or http://localhost, e.g. through kubectl port-forward)
+let mediaRec = null;
+$("recBtn").onclick = async () => {
+  if (mediaRec && mediaRec.state === "recording") { mediaRec.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const chunks = [];
+    mediaRec = new MediaRecorder(stream);
+    mediaRec.ondataavailable = e => chunks.push(e.data);
+    mediaRec.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      recorded = new Blob(chunks, { type: mediaRec.mimeType });
+      $("recBtn").textContent = "Record"; $("recBtn").classList.remove("rec");
+      $("recInfo").innerHTML = "";
+      const a = document.createElement("audio"); a.controls = true; a.src = URL.createObjectURL(recorded);
+      $("recInfo").append("Recorded clip (used instead of the file): ", a);
+    };
+    mediaRec.start();
+    $("recBtn").textContent = "Stop"; $("recBtn").classList.add("rec");
+    $("recInfo").textContent = "Recording… read your transcript aloud, then press Stop.";
+  } catch (e) {
+    $("recInfo").textContent = "Microphone unavailable here (needs HTTPS or localhost): " + e.message;
+  }
+};
+
+$("addForm").onsubmit = async e => {
+  e.preventDefault();
+  $("addErr").textContent = "";
+  const file = recorded || $("vFile").files[0];
+  if (!file) { $("addErr").textContent = "Choose a file or record a clip."; return; }
+  const fd = new FormData();
+  fd.append("name", $("vName").value.trim());
+  fd.append("file", file, recorded ? "recording.webm" : file.name);
+  fd.append("ref_text", $("vText").value);
+  fd.append("language", $("vLang").value || "Auto");
+  fd.append("overwrite", $("vOverwrite").checked);
+  $("addBtn").disabled = true;
+  try {
+    const r = await fetch("/v1/voices", { method: "POST", body: fd });
+    if (!r.ok) throw new Error(await errText(r));
+    const v = await r.json();
+    recorded = null; $("recInfo").textContent = ""; $("addForm").reset();
+    await loadVoices(); $("voice").value = v.name;
+  } catch (err) { $("addErr").textContent = err.message; }
+  finally { $("addBtn").disabled = false; }
+};
+
+$("genForm").onsubmit = async e => {
+  e.preventDefault();
+  $("genErr").textContent = "";
+  if (!$("voice").value) { $("genErr").textContent = "Add a voice first."; return; }
+  const body = {
+    input: $("text").value, voice: $("voice").value, language: $("lang").value,
+    response_format: $("fmt").value,
+    temperature: +$("temperature").value, top_p: +$("top_p").value, top_k: +$("top_k").value,
+    repetition_penalty: +$("repetition_penalty").value, speed: +$("speed").value,
+  };
+  if ($("seed").value !== "") body.seed = +$("seed").value;
+  $("genBtn").disabled = true; $("timing").textContent = "Generating…";
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/v1/audio/speech", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error(await errText(r));
+    const blob = await r.blob(), url = URL.createObjectURL(blob);
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    $("timing").textContent = `Done in ${secs}s`;
+    const div = document.createElement("div"); div.className = "clip";
+    div.innerHTML = `<div class="meta"><span></span><span></span><a download>download</a></div><audio controls></audio>`;
+    const [txt, params] = div.querySelectorAll(".meta span");
+    txt.textContent = `${body.voice}: ${body.input}`;
+    params.textContent = `T ${body.temperature} · p ${body.top_p} · k ${body.top_k} · rp ${body.repetition_penalty}${body.seed != null ? " · seed " + body.seed : ""} · ${secs}s`;
+    const a = div.querySelector("a"); a.href = url; a.download = `${body.voice}-${Date.now()}.${body.response_format}`;
+    a.style.color = "var(--accent)";
+    const au = div.querySelector("audio"); au.src = url;
+    $("out").prepend(div); au.play();
+  } catch (err) { $("genErr").textContent = err.message; $("timing").textContent = ""; }
+  finally { $("genBtn").disabled = false; }
+};
+
+pollStatus(); loadVoices();
+</script>
+</body>
+</html>

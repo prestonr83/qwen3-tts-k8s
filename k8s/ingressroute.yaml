@@ -1,0 +1,21 @@
+# Optional: web UI at https://qwen-tts.rdz.sh through your existing Traefik.
+# Needs (1) an internal DNS record qwen-tts.rdz.sh -> 10.0.0.160, like tts.rdz.sh, and
+# (2) a TLS secret "qwen-tts-rdz-sh-tls" in namespace tts, made the same way as tts-rdz-sh-tls.
+# HTTPS also lets the browser use the microphone for the "Record" button.
+# The server has NO authentication: anyone who can reach it can generate speech
+# and upload voices. Keep it LAN-only.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: qwen3-tts-https
+spec:
+  entryPoints: [websecure]
+  routes:
+    - kind: Rule
+      match: Host(`qwen-tts.rdz.sh`)
+      services:
+        - name: qwen3-tts
+          port: 8005
+          scheme: http
+  tls:
+    secretName: qwen-tts-rdz-sh-tls

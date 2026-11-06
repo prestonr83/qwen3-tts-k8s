@@ -1,0 +1,126 @@
+# Qwen3-TTS in the existing "tts" namespace (shared with chatterbox).
+# The namespace itself isn't declared here so that deleting this app never removes chatterbox.
+---
+# Hugging Face cache: the 1.7B Base model + 12Hz tokenizer are ~5 GB.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qwen3-tts-models
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+# Saved voices: reference clip + transcript per voice.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qwen3-tts-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-tts
+  labels:
+    app: qwen3-tts
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate            # single GPU: never run two copies at once
+  selector:
+    matchLabels:
+      app: qwen3-tts
+  template:
+    metadata:
+      labels:
+        app: qwen3-tts
+    spec:
+      runtimeClassName: nvidia
+      nodeSelector:
+        kubernetes.io/hostname: k3s-server-01
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: qwen3-tts
+          image: ghcr.io/prestonr83/qwen3-tts-server
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # Swap to Qwen/Qwen3-TTS-12Hz-0.6B-Base if VRAM gets tight.
+            - name: MODEL_ID
+              value: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+            - name: DTYPE
+              value: bfloat16
+            - name: ATTN_IMPL
+              value: sdpa
+            - name: DEFAULT_LANGUAGE
+              value: English
+            # Voice used when a request names none (e.g. Home Assistant default). Blank = first saved voice.
+            - name: DEFAULT_VOICE
+              value: ""
+            - name: HF_HOME
+              value: /models
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: expandable_segments:True
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              memory: 12Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - { name: models, mountPath: /models }
+            - { name: data,   mountPath: /data }
+          # The process answers /livez right away; /healthz turns 200 once the model is
+          # downloaded and loaded. The first start downloads ~5 GB, so allow up to 20 minutes.
+          startupProbe:
+            httpGet: { path: /livez, port: http }
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /livez, port: http }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: qwen3-tts-models
+        - name: data
+          persistentVolumeClaim:
+            claimName: qwen3-tts-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3-tts
+  labels:
+    app: qwen3-tts
+spec:
+  selector:
+    app: qwen3-tts
+  ports:
+    - name: http
+      port: 8005
+      targetPort: http
